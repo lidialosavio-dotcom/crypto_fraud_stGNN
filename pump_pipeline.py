@@ -22,6 +22,8 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import copy
 import os
+from scipy.spatial.distance import pdist, squareform
+from sklearn.neighbors import NearestNeighbors
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -59,9 +61,11 @@ WINDOW_SIZE = 5  # Guardiamo le 5 ore precedenti (inclusa l'attuale)
 
 # Graph Config
 MIN_CORR_THRESHOLD = 0.15 
+# Where is target density used?
 TARGET_DENSITY = 0.95 
 
 # Model Hyperparameters
+# How can we select optimally these hyperparameters?
 HIDDEN_CHANNELS = 64
 HEADS = 2            
 LEARNING_RATE = 0.001 
@@ -114,37 +118,121 @@ dates_test  = unique_dates[val_end_idx + EMBARGO_STEPS :]
 print(f"Train: {len(dates_train)} h | Val: {len(dates_val)} h | Test: {len(dates_test)} h")
 
 ## --- 6. COSTRUZIONE GRAFO (STRUTTURA) ---
-print("\n--- Costruzione Grafo (Correlation) ---")
+def Graph_construction(method_graph=0, kNN=10):
 
-#df_structure = df[df[DATE_COL].isin(np.concatenate([dates_train, dates_val]))].copy()
-df_structure = df[df[DATE_COL].isin(dates_train)].copy()
+    # Keep the training data    
+    df_structure = df[df[DATE_COL].isin(dates_train)].copy()
+    # Pivot table for volume
+    vol_pivot = df_structure.pivot_table(index=DATE_COL, columns=GROUP_COL, values='volume').fillna(0)
+    # Reindec
+    vol_pivot = vol_pivot.reindex(columns=unique_symbols, fill_value=0) 
+    # Get the log before computing correlation
+    vol_log = np.log1p(vol_pivot)
 
-vol_pivot = df_structure.pivot_table(index=DATE_COL, columns=GROUP_COL, values='volume').fillna(0)
-vol_pivot = vol_pivot.reindex(columns=unique_symbols, fill_value=0) 
-vol_log = np.log1p(vol_pivot) 
+    if method_graph == 0:
+        print("--- Graph construction based on correlation of volume, method = {method_graph} ---")
+        corr_matrix = vol_log.corr(method='pearson').fillna(0)
+        sim_matrix = corr_matrix.values
+        
+    elif method_graph == 1:
+        print(f"--- Graph construction based on similarity of all features, method = {method_graph} ---")
+        # Gaussian similarity, according to: Zelnik-Manor and Perona (2005)
+        
+        # Feature matrix
+        # Pts: [N_nodes, Time * N_features]
+        feature_matrices = []
+        
+        for feat in raw_feature_cols:
+            # Pivot table: [Time, Nodes]
+            feat_pivot = df_structure.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feat).fillna(0)
+            feat_pivot = feat_pivot.reindex(columns=unique_symbols, fill_value=0)
+            
+            # Scaling (z-score) across time and nodes
+            # Subtract the mean and divide by the standard deviation (all global)
+            # I think we can do this with the StandardScaler as well, gotta check
+            # https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.StandardScaler.html
+            vals = feat_pivot.values
+            vals_scaled = (vals - np.mean(vals)) / (np.std(vals) + 1e-12)
+            
+            # Transpose to [Nodes, Time]
+            feature_matrices.append(vals_scaled.T)
+            
+        # Concatenate features: [Nodes, Time * N_features]
+        Pts = np.concatenate(feature_matrices, axis=1)
+        
+        # sklearn NearestNeighbors
+        # We need kNN neighbors + 1 (self) to find the k-th neighbor
+        # Let's think more about which distance to use 
+        # https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.NearestNeighbors.html
+        nbrs = NearestNeighbors(n_neighbors=kNN + 1, algorithm='auto', metric='euclidean').fit(Pts)
+        distances, indices = nbrs.kneighbors(Pts)
+        
+        # Sigma scaling acc. to the distance to the k-th neighbor
+        # indices[:, 0] is self, indices[:, kNN] is the k-th neighbor
+        sigmas = distances[:, kNN]
+        
+        # Collect all unique edges found by kNN
+        edge_dict = {} # (u, v) -> distance
+        
+        for i in range(num_nodes):
+            # Iterate over neighbors (skip self = 0)
+            for k in range(1, kNN + 1):
+                j = indices[i, k]
+                d = distances[i, k]
+                
+                # Store edge with sorted indices to ensure uniqueness (u < v)
+                if i < j:
+                    edge_dict[(i, j)] = d
+                else:
+                    edge_dict[(j, i)] = d
+        
+        sources, targets, weights = [], [], []
+        
+        # compute similarity only on the kNN edges
+        for (u, v), d in edge_dict.items():
+            # sigma_uv = max{sigma_u, sigma_v}
+            sigma_edge = max(sigmas[u], sigmas[v])
+            if sigma_edge == 0:
+                sigma_edge = 1e-12
+            
+            # Gaussian similarity (weights)
+            # s_i(j) = exp(-4 * (d_i(j)^2) / (sigma_i(j)^2)) 
+            w = np.exp(-4 * (d**2) / (sigma_edge**2))
+            
+            # Add undirected edge
+            sources.extend([u, v])
+            targets.extend([v, u])
+            weights.extend([w, w])
 
-corr_matrix = vol_log.corr(method='pearson').fillna(0)
-# --- SANITY CHECK ---
+    # Build the edge list
+    # For method 0 (correlation), we have the sim_matrix, for method 1 (kNN), we have the edge list.
+    
+    if method_graph == 0:
+        np.fill_diagonal(sim_matrix, 0)
+        percentile_thresh = np.percentile(sim_matrix.flatten(), TARGET_DENSITY * 100)
+        effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
 
-np.fill_diagonal(corr_matrix.values, 0)
-percentile_thresh = np.percentile(corr_matrix.values.flatten(), TARGET_DENSITY * 100)
-effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
+        sources, targets, weights = [], [], []
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                val = sim_matrix[i, j]
+                if val > effective_thresh:
+                    sources.extend([i, j])
+                    targets.extend([j, i])
+                    weights.extend([val, val])
 
-sources, targets, weights = [], [], []
-for i in range(num_nodes):
-    for j in range(i + 1, num_nodes):
-        val = corr_matrix.iloc[i, j]
-        if val > effective_thresh:
-            sources.extend([i, j])
-            targets.extend([j, i])
-            weights.extend([val, val])
+    if not sources:
+        sources, targets = list(range(num_nodes)), list(range(num_nodes))
+        weights = [1.0] * num_nodes
 
-if not sources:
-    sources, targets = list(range(num_nodes)), list(range(num_nodes))
-    weights = [1.0] * num_nodes
+    edge_index = torch.tensor([sources, targets], dtype=torch.long)
+    edge_attr  = torch.tensor(weights, dtype=torch.float)
+    
+    return edge_index, edge_attr
 
-edge_index = torch.tensor([sources, targets], dtype=torch.long)
-edge_attr  = torch.tensor(weights, dtype=torch.float)
+# method_graph = 0 (correlation) or 1 (kNN)
+method_graph = 0
+edge_index, edge_attr = Graph_construction(method_graph)
 # ## --- 6. COSTRUZIONE GRAFO (STRUTTURA SU NUM_TRADES) ---
 # print("\n--- Costruzione Grafo (Correlation su num_trades) ---")
 # # Filtriamo solo le date di training/validation per costruire la struttura (evitiamo leakage dal test)
