@@ -1,3 +1,5 @@
+
+
 # =====================================================================================
 # Script overview (general description):
 #
@@ -14,7 +16,7 @@
 # - The graph is built from correlations computed on TRAIN data only.
 # - We identify "pump events" (timestamps in train where at least one node has label=1).
 # - For each pump timestamp p, we compute an NxN correlation matrix on a time window
-#   [p - PUMP_WINDOW_HOURS, p + PUMP_WINDOW_HOURS] using a chosen feature (CORR_FEATURE).
+#   [p - PUMP_WINDOW_HOURS, p] using a chosen feature (CORR_FEATURE). mean F1 = 74 --- RF mean F1 = 71 --- F1 = 73/74
 # - We maintain an evolving edge set (edge_stats) that accumulates correlation evidence
 #   across pump windows:
 #     - Optionally update weights for existing edges even if correlation is low/negative.
@@ -33,6 +35,7 @@
 # - The model is selected by best validation F1 (computed at a fixed threshold).
 # - Final test metrics are reported using the same fixed threshold.
 # =====================================================================================
+
 
 import numpy as np
 import pandas as pd
@@ -97,8 +100,8 @@ TARGET_DENSITY = 0.95
 # DYNAMIC GRAPH CONFIG
 # ----------------------------
 # Window size for correlation computation around each pump timestamp in TRAIN.
-# The window is [pump - 48h, pump + 48h] (clipped within train timestamps).
-PUMP_WINDOW_HOURS = 48           # +/- 48 hours around each pump in TRAIN
+# The window is [pump - 48h, pump] (clipped within train timestamps).
+PUMP_WINDOW_HOURS = 48           # ONLY 48 hours LOOKBACK from each pump in TRAIN (no right side)
 
 # Feature column used for correlation-based graph construction.
 CORR_FEATURE = "volume"          # feature used for correlation (e.g., "volume", "num_trades")
@@ -222,17 +225,31 @@ pump_dates = pd.DatetimeIndex(pump_dates).sort_values()
 
 print(f"Pump events nel TRAIN: {len(pump_dates)} (timestamps unici)")
 
+#BEFORE
+# def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
+#     """Restituisce le date nel train nella finestra [pump-48, pump+48] (clippata)."""
+#     pos = train_dates_index.searchsorted(pump_date)
+#     if pos == len(train_dates_index) or train_dates_index[pos] != pump_date:
+#         pos = max(0, pos - 1)
+
+#     left = max(0, pos - window_h)
+#     right = min(len(train_dates_index) - 1, pos + window_h)
+#     return train_dates_index[left:right+1]
+
 def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
-    """Return the TRAIN timestamps within the window [pump-48, pump+48] (clipped)."""
+    """Return the TRAIN timestamps within the window [pump-48, pump] (clipped)."""
     # Locate the pump timestamp position in the sorted train index.
     pos = train_dates_index.searchsorted(pump_date)
     # If pump_date is not exactly present, move to the closest prior index.
     if pos == len(train_dates_index) or train_dates_index[pos] != pump_date:
         pos = max(0, pos - 1)
 
-    # Clip left and right boundaries within valid train index bounds.
+    # Clip left boundary within valid train index bounds.
     left = max(0, pos - window_h)
-    right = min(len(train_dates_index) - 1, pos + window_h)
+
+    # IMPORTANT: to avoid leakage, we updated the code so that the right boundary is the pump itself (no future).
+    right = pos
+
     return train_dates_index[left:right+1]
 
 def _corr_matrix_on_dates(df_full, dates_window, feature_col, method=CORR_METHOD, symbols_order=None):
@@ -703,3 +720,4 @@ print(f"Recall:    {recall_score(test_true, final_preds, zero_division=0):.4f}")
 print(f"F1 Score:  {f1_score(test_true, final_preds, zero_division=0):.4f}")
 print("Confusion Matrix:")
 print(confusion_matrix(test_true, final_preds))
+

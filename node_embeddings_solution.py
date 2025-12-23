@@ -10,7 +10,7 @@
 #   lookback snapshots: x_seq has shape [N_nodes, WINDOW_SIZE, N_features].
 # - We learn a self-adaptive (data-driven) graph structure using two learnable node
 #   embedding tables (E1, E2). Their bilinear product yields a dense score matrix
-#   [N, N] that is row-wise softmax-normalized into a probabilistic adjacency A.
+#   [N, N] that is row-wise softmax-normalized into a probabilistic adjacency A. -- mean F1 = 78
 #   This is conceptually aligned with Graph WaveNet's adaptive adjacency mechanism:
 #   node embeddings parameterize pairwise affinities, producing a learned connectivity
 #   pattern rather than relying on a fixed, externally provided graph.
@@ -26,6 +26,30 @@
 #   adjacency (often via softmax(ReLU(E1 E2^T))). This script follows that pattern,
 #   then uses a threshold to keep edges above a minimum weight for message passing.
 # =====================================================================================
+
+###  MLP, RF, XGBoost, LSTM -- Luca
+
+### static similarity, static correlation (volume), static correlation (num_trades)
+
+### dynamic with similarity -- Dim, dynamic with correlation (volume), dynamic with correlation (num_trades), dynamic with node embeddings (WaveNet)
+
+### Kind of results:
+    ### F1 score on the entire dataset (mean across 9 seeds) --- table, F1 score per tokens* --- candle stick charts and barplot,
+    ### F1 score + additional features**, F1 score with minutes
+    
+
+### *Select only tokens with 5 or more pump events
+    ### A = [t32 = 1, t100 = 0, ...] --- |A| = 10 --- F1scoreTokenA = ...
+    ### B = [t32 = 1, t101 = 0, ...] --- |B| = 3 --- F1scoreTokenB = ...
+    ### Possible limitation = these performances are computed using the dataset construction around pump events, to better understand the performances on a single
+    ### token history we can consider only one token per time and having the entire history for that token 
+
+### **As Sapienza + prices -- Luca
+
+### Contributions:
+    ### Comprehensive comparison of methods for P&D event with modern static/dynamic spatio-temporal gnns applied to pump-and-dump crime
+    ### pipeline for pump-and-dump crime evaluation/detection
+    ### Code and data given
 
 import numpy as np
 import pandas as pd
@@ -99,7 +123,7 @@ FIXED_THRESHOLD = 0.5
 # SELF-ADAPTIVE ADJACENCY CONFIG
 # ----------------------------
 # Dimension of the learnable node embeddings used to generate adaptive adjacency.
-ADP_DIM = 32
+ADP_DIM = 32 #64, 128
 
 # Optional ReLU on scores before softmax (removes negative affinities).
 ADP_USE_RELU = True
@@ -108,7 +132,7 @@ ADP_USE_RELU = True
 ADP_ADD_SELF_LOOPS = False
 
 # Threshold on adjacency weights after softmax: keep edges only if weight > threshold.
-ADP_GRAPH_THRESHOLD = 0.015  
+ADP_GRAPH_THRESHOLD = 0.015   
 
 # Column names and drop list for feature selection.
 DATE_COL   = "date"
