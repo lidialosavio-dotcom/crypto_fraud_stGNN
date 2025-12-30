@@ -1,5 +1,4 @@
 
-
 # =====================================================================================
 # Script overview (general description):
 #
@@ -12,16 +11,12 @@
 #   (3) A temporal TransformerEncoder applied across the WINDOW_SIZE sequence of
 #       spatial embeddings to produce the final per-node probability.
 #
-# Graph construction approach (dynamic correlation graph):
-# - The graph is built from correlations computed on TRAIN data only.
+# Graph construction approach (dynamic kNN + Gaussian similarity graph):
+# - The graph is built from kNN similarity computed on TRAIN data only.
 # - We identify "pump events" (timestamps in train where at least one node has label=1).
-# - For each pump timestamp p, we compute an NxN correlation matrix on a time window
-#   [p - PUMP_WINDOW_HOURS, p] using a chosen feature (CORR_FEATURE). mean F1 = 74 --- RF mean F1 = 71 --- F1 = 73/74
-# - We maintain an evolving edge set (edge_stats) that accumulates correlation evidence
-#   across pump windows:
-#     - Optionally update weights for existing edges even if correlation is low/negative.
-#     - Add new edges if correlation exceeds a per-window threshold (percentile-based,
-#       with a minimum threshold MIN_CORR_THRESHOLD).
+# - For each pump timestamp p, we compute kNN and Gaussian weights on a time window
+#   [p - PUMP_WINDOW_HOURS, p] using all node features.
+# - We maintain an evolving edge set (edge_stats) that accumulates evidence across pump windows.
 # - For each pump, we store a snapshot of the current graph (mean weights so far).
 # - During training snapshots, we use the graph "state" corresponding to the most recent
 #   pump at or before the current timestamp. Before any pump, a safe base graph is used.
@@ -52,6 +47,7 @@ import copy
 import os
 
 from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, confusion_matrix, precision_recall_curve
 )
@@ -92,9 +88,8 @@ EMBARGO_STEPS = 5
 # Number of past steps included in each sample window (sequence length for temporal model).
 WINDOW_SIZE = 5
 
-# Minimum correlation threshold and target density used to derive per-window thresholds.
-MIN_CORR_THRESHOLD = 0.15
-TARGET_DENSITY = 0.95
+# kNN Graph Config
+KNN_K = 10                  # Number of neighbors
 
 # ----------------------------
 # DYNAMIC GRAPH CONFIG
@@ -102,20 +97,6 @@ TARGET_DENSITY = 0.95
 # Window size for correlation computation around each pump timestamp in TRAIN.
 # The window is [pump - 48h, pump] (clipped within train timestamps).
 PUMP_WINDOW_HOURS = 48           # ONLY 48 hours LOOKBACK from each pump in TRAIN (no right side)
-
-# Feature column used for correlation-based graph construction.
-CORR_FEATURE = "volume"          # feature used for correlation (e.g., "volume", "num_trades")
-
-# Correlation method used by pandas corr().
-CORR_METHOD = "pearson"          # correlation method
-
-# If True, for each pump window we also update weights for edges that already exist
-# in edge_stats, even when the new correlation value is low or negative.
-UPDATE_EXISTING_WITH_LOW_CORR = True   # update weights even if correlation is low/negative
-
-# If True, new edges can also be created for strong negative correlations using abs(corr) > thr.
-# If False, only positive correlations mat > thr create new edges.
-USE_ABS_FOR_NEW_EDGES = False    # True => add edges also for strong negative correlations (abs(corr) > thr)
 
 # Model/training hyperparameters.
 HIDDEN_CHANNELS = 64
@@ -135,7 +116,6 @@ LABEL_COL  = "flag"
 GROUP_COL  = "symbol"
 
 # Columns excluded from feature selection (targets, identifiers, non-feature columns).
-# TODO: The feature selection has to be part of the script.
 DROP_COLS_TRAIN = [
     DATE_COL, LABEL_COL, GROUP_COL,
     "high", "low", "close", "group",
@@ -196,10 +176,9 @@ dates_test  = unique_dates[val_end_idx + EMBARGO_STEPS :]
 print(f"Train: {len(dates_train)} h | Val: {len(dates_val)} h | Test: {len(dates_test)} h")
 
 # ----------------------------
-# 6) DYNAMIC GRAPH (correlation updates on windows around pump events in TRAIN)
+# 6) DYNAMIC GRAPH (kNN updates on windows around pump events in TRAIN)
 # ----------------------------
-print()
-print("--- Costruzione Grafo DINAMICO (Correlation su finestre pump) ---")
+print("\n--- Dynamic graph construction (kNN + Gaussian on pump windows) ---\n")
 
 # Base graph used as a safe fallback (self-loops only).
 # This is used before the first pump event (or in edge-empty situations).
@@ -208,10 +187,6 @@ base_edge_attr  = torch.ones(num_nodes, dtype=torch.float)
 
 # Subset train rows for pump detection and window slicing.
 df_train = df[df[DATE_COL].isin(dates_train)].copy()
-
-# Ensure correlation feature exists.
-if CORR_FEATURE not in df.columns:
-    raise ValueError(f"Colonna '{CORR_FEATURE}' non trovata nel dataframe.")
 
 # Sorted DatetimeIndex of TRAIN timestamps for robust index-based window slicing.
 train_dates_idx = pd.DatetimeIndex(dates_train).sort_values()
@@ -225,17 +200,6 @@ pump_dates = (
 pump_dates = pd.DatetimeIndex(pump_dates).sort_values()
 
 print(f"Pump events nel TRAIN: {len(pump_dates)} (timestamps unici)")
-
-#BEFORE
-# def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
-#     """Restituisce le date nel train nella finestra [pump-48, pump+48] (clippata)."""
-#     pos = train_dates_index.searchsorted(pump_date)
-#     if pos == len(train_dates_index) or train_dates_index[pos] != pump_date:
-#         pos = max(0, pos - 1)
-
-#     left = max(0, pos - window_h)
-#     right = min(len(train_dates_index) - 1, pos + window_h)
-#     return train_dates_index[left:right+1]
 
 def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
     """Return the TRAIN timestamps within the window [pump-48, pump] (clipped)."""
@@ -253,31 +217,81 @@ def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW
 
     return train_dates_index[left:right+1]
 
-def _corr_matrix_on_dates(df_full, dates_window, feature_col, method=CORR_METHOD, symbols_order=None):
-    """Compute an NxN correlation matrix on a date window using feature_col (pivoted by symbol)."""
-    # Subset rows in the requested window and pivot to [time, symbol] matrix for the feature.
+# Pre-compute global stats for standardization (to be consistent across windows)
+# shape: {feat: (mean, std)}
+feat_stats = {}
+for feat in raw_feature_cols:
+    feat_pivot = df_train.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feat).fillna(0)
+    vals = feat_pivot.values
+    feat_stats[feat] = (np.mean(vals), np.std(vals) + 1e-12)
+
+def compute_knn_gaussian_edges_for_window(df_full, dates_window):
+    """Compute kNN + Gaussian edges for a given time window."""
+    # Construct feature matrix [Nodes, Time * Features]
+    feature_matrices = []
+    
+    # take subset
     sub = df_full[df_full[DATE_COL].isin(dates_window)].copy()
-    pivot = sub.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feature_col).fillna(0)
+    
+    for feat in raw_feature_cols:
+        # Pivot: [Time, Nodes]
+        pivot = sub.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feat).fillna(0)
+        # Ensure correct column order
+        pivot = pivot.reindex(columns=unique_symbols, fill_value=0)
+        
+        # Standardize using GLOBAL train stats
+        mean_val, std_val = feat_stats[feat]
+        vals_scaled = (pivot.values - mean_val) / std_val
+        
+        # Transpose to [Nodes, Time] and append
+        feature_matrices.append(vals_scaled.T)
+        
+    # Concatenate features: [Nodes, Time * Num_Features]
+    Pts = np.concatenate(feature_matrices, axis=1)
+    
+    # kNN search
+    # We need k+1 neighbors (including self)
+    # Using 'euclidean' metric
+    nbrs = NearestNeighbors(n_neighbors=KNN_K + 1, algorithm='auto', metric='euclidean').fit(Pts)
+    distances, indices = nbrs.kneighbors(Pts)
+    
+    # Gaussian similarity
+    # Local scaling sigma: distance to the k-th neighbor
+    sigmas = distances[:, KNN_K]
+    
+    new_edges = {} # (u, v) -> weight
+    
+    for i in range(num_nodes):
+        sigma_i = sigmas[i] if sigmas[i] > 0 else 1e-12
+        
+        for k_idx in range(1, KNN_K + 1):
+            j = indices[i, k_idx]
+            d = distances[i, k_idx]
+            
+            # Skip self-loops
+            if i == j: continue
+            
+            sigma_j = sigmas[j] if sigmas[j] > 0 else 1e-12
+            
+            # Symmetric Sigma
+            sigma_edge = max(sigma_i, sigma_j)
+            
+            # Gaussian similarity (weights)
+            # s_i(j) = exp(-4 * (d_i(j)^2) / (sigma_i(j)^2))
+            w = np.exp(-4 * (d**2) / (sigma_edge**2))
+            
+            # Enforce symmetry by storing ordered pair
+            u, v = (i, j) if i < j else (j, i)
+            
+            # If multiple directions/occurrences in same window (unlikely for kNN unless symmetric), max or avg?
+            # take max weight if both see each other (or overwrite).
+            if (u, v) in new_edges:
+                new_edges[(u, v)] = max(new_edges[(u, v)], w)
+            else:
+                new_edges[(u, v)] = w
+                
+    return new_edges
 
-    # Enforce a fixed column order across windows (ensures consistent node indexing).
-    if symbols_order is not None:
-        pivot = pivot.reindex(columns=symbols_order, fill_value=0)
-
-    # Stabilize scale by log(1 + x) and compute correlation across symbols.
-    pivot_log = np.log1p(pivot)
-    corr = pivot_log.corr(method=method).fillna(0)
-
-    # Remove self-correlation on the diagonal.
-    np.fill_diagonal(corr.values, 0)
-
-    # Return as a NumPy array for downstream selection logic.
-    return corr.values  # numpy (N,N)
-
-def _effective_threshold(corr_vals, target_density=TARGET_DENSITY, min_thr=MIN_CORR_THRESHOLD):
-    # Derive a threshold from the desired density percentile, but enforce a minimum.
-    flat = corr_vals.reshape(-1)
-    perc_thr = np.percentile(flat, target_density * 100)
-    return float(max(min_thr, perc_thr))
 
 def _edge_stats_to_tensors(edge_stats_dict, num_nodes):
     """
@@ -304,108 +318,44 @@ def _edge_stats_to_tensors(edge_stats_dict, num_nodes):
     edge_attr  = torch.tensor(weights, dtype=torch.float)
     return edge_index, edge_attr
 
-# If there are no pump events in TRAIN, build a static graph over the entire TRAIN period.
+# If there are no pump events in TRAIN, use base graph.
 if len(pump_dates) == 0:
-    print("ATTENZIONE: nessun pump nel TRAIN. Fallback a grafo statico su tutto il train (come prima).")
-
-    df_structure = df[df[DATE_COL].isin(dates_train)].copy()
-    vol_pivot = df_structure.pivot_table(index=DATE_COL, columns=GROUP_COL, values=CORR_FEATURE).fillna(0)
-    vol_pivot = vol_pivot.reindex(columns=unique_symbols, fill_value=0)
-    vol_log = np.log1p(vol_pivot)
-
-    corr_matrix = vol_log.corr(method=CORR_METHOD).fillna(0)
-    np.fill_diagonal(corr_matrix.values, 0)
-
-    percentile_thresh = np.percentile(corr_matrix.values.flatten(), TARGET_DENSITY * 100)
-    effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
-
-    sources, targets, weights = [], [], []
-    # Build an undirected candidate set from the upper triangle, then add both directions.
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            val = corr_matrix.iloc[i, j]
-            if val > effective_thresh:
-                sources.extend([i, j])
-                targets.extend([j, i])
-                weights.extend([val, val])
-
-    # If thresholding yields no edges, fall back to base graph.
-    if not sources:
-        final_edge_index, final_edge_attr = base_edge_index, base_edge_attr
-    else:
-        final_edge_index = torch.tensor([sources, targets], dtype=torch.long)
-        final_edge_attr  = torch.tensor(weights, dtype=torch.float)
-
-    # No dynamic snapshots exist in this branch.
-    dynamic_graph_updates = {}  # no dynamic snapshot graph states
+    print("ATTENZIONE: nessun pump nel TRAIN. Fallback a grafo statico (base).")
+    final_edge_index, final_edge_attr = base_edge_index, base_edge_attr
+    dynamic_graph_updates = {}
 else:
     # edge_stats accumulates per-undirected-edge statistics across pump windows:
-    # key=(i,j) with i<j, value=[sum_corr, count_updates]
+    # key=(i,j) with i<j, value=[sum_weight, count_updates]
     edge_stats = {}
     dynamic_graph_updates = {}  # pump_date -> (edge_index, edge_attr) AFTER applying this pump update
-
-    # Fixed symbol column order for pivot tables.
-    symbols_order = unique_symbols
 
     for k, pdate in enumerate(pump_dates):
         # Determine the train timestamps within the pump-centered window.
         win_dates = _window_dates_around_pump(pdate, train_dates_idx, window_h=PUMP_WINDOW_HOURS)
 
-        # Compute correlation matrix on that window.
-        corr_vals = _corr_matrix_on_dates(
-            df_full=df,
-            dates_window=win_dates,
-            feature_col=CORR_FEATURE,
-            method=CORR_METHOD,
-            symbols_order=symbols_order
-        )
-
-        # Compute a per-window threshold (percentile-based, min-capped).
-        thr = _effective_threshold(corr_vals, target_density=TARGET_DENSITY, min_thr=MIN_CORR_THRESHOLD)
-
-        # (1) Update weights for existing edges using the current window correlation values.
-        # This is performed even if the new value is low/negative when enabled.
-        if UPDATE_EXISTING_WITH_LOW_CORR and len(edge_stats) > 0:
-            for (i, j), sc in edge_stats.items():
-                s, c = sc
-                v = float(corr_vals[i, j])
-                edge_stats[(i, j)][0] = s + v
-                edge_stats[(i, j)][1] = c + 1
-
-        # (2) Add new edges based on the current window correlation threshold.
-        mat = corr_vals
-        if USE_ABS_FOR_NEW_EDGES:
-            sel = np.abs(mat) > thr
-        else:
-            sel = mat > thr
-
-        # Only consider i<j candidates (upper triangle).
-        iu = np.triu_indices(num_nodes, k=1)
-        cand_mask = sel[iu]
-        cand_i = iu[0][cand_mask]
-        cand_j = iu[1][cand_mask]
+        # Compute kNN edges for this window
+        window_edges = compute_knn_gaussian_edges_for_window(df, win_dates)
 
         new_added = 0
-        for i, j in zip(cand_i, cand_j):
-            key = (int(i), int(j))
-            if key not in edge_stats:
+        for (u, v), w in window_edges.items():
+            if (u, v) not in edge_stats:
                 # First time this edge is observed: initialize sum and count.
-                edge_stats[key] = [float(mat[i, j]), 1]
+                #  (2) Add new edges that are in the top-k
+                edge_stats[(u, v)] = [float(w), 1]
                 new_added += 1
             else:
-                # If not updating existing edges globally, optionally accumulate here.
-                if not UPDATE_EXISTING_WITH_LOW_CORR:
-                    edge_stats[key][0] += float(mat[i, j])
-                    edge_stats[key][1] += 1
+                # Accumulate
+                # (1) Update existing edges (if they are still in Top-K this window)
+                edge_stats[(u, v)][0] += float(w)
+                edge_stats[(u, v)][1] += 1
 
         # (3) Store the current graph state after this pump:
         # Convert accumulated stats to edge_index/edge_attr (mean weight per undirected edge).
         curr_edge_index, curr_edge_attr = _edge_stats_to_tensors(edge_stats, num_nodes)
         dynamic_graph_updates[pdate] = (curr_edge_index, curr_edge_attr)
 
-        # Keep the original print format unchanged (Italian labels) as it is runtime output.
         print(f"[{k+1}/{len(pump_dates)}] pump @ {pdate} | "
-              f"win={len(win_dates)}h | thr={thr:.4f} | "
+              f"win={len(win_dates)}h | "
               f"new_edges={new_added} | total_undirected_edges={len(edge_stats)}")
 
     # Final graph is the state after the last pump in TRAIN.
@@ -607,7 +557,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 criterion = torch.nn.BCELoss()
 
 # ----------------------------
-# 9) EVAL UTILS (threshold on VAL)  <-- kept identical, but not used
+# 9) EVAL UTILS (threshold on VAL)
 # ----------------------------
 @torch.no_grad()
 def collect_probs_and_true(loader):
@@ -721,4 +671,3 @@ print(f"Recall:    {recall_score(test_true, final_preds, zero_division=0):.4f}")
 print(f"F1 Score:  {f1_score(test_true, final_preds, zero_division=0):.4f}")
 print("Confusion Matrix:")
 print(confusion_matrix(test_true, final_preds))
-
