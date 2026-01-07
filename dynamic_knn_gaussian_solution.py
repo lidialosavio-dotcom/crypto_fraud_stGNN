@@ -31,7 +31,6 @@
 # - Final test metrics are reported using the same fixed threshold.
 # =====================================================================================
 
-
 import numpy as np
 import pandas as pd
 import warnings
@@ -58,7 +57,7 @@ warnings.filterwarnings("ignore")
 # ----------------------------
 # 1) SEED
 # ----------------------------
-def set_seed(seed=44):
+def set_seed(seed=11):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -69,7 +68,7 @@ def set_seed(seed=44):
     os.environ["PYTHONHASHSEED"] = str(seed)
     print(f"Seed fixed to {seed}.")
 
-set_seed(55)
+set_seed(99)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -102,7 +101,7 @@ PUMP_WINDOW_HOURS = 48           # ONLY 48 hours LOOKBACK from each pump in TRAI
 HIDDEN_CHANNELS = 64
 HEADS = 2
 LEARNING_RATE = 0.001
-EPOCHS = 100
+EPOCHS = 50
 DROPOUT = 0.4
 BATCH_SIZE = 64
 
@@ -140,6 +139,7 @@ df[LABEL_COL] = df[LABEL_COL].astype(int).clip(0, 1)
 # Define the node universe as the set of unique symbols; map each symbol to an index.
 unique_symbols = df[GROUP_COL].unique()
 symbol_to_idx = {sym: i for i, sym in enumerate(unique_symbols)}
+idx_to_symbol = {i: sym for sym, i in symbol_to_idx.items()}  # <<< ADDED (per metriche token)
 num_nodes = len(unique_symbols)
 print(f"Dataset: {len(df)} righe, {num_nodes} token unici.")
 
@@ -154,6 +154,7 @@ raw_feature_cols = [
 ]
 print(f"Features Selezionate ({len(raw_feature_cols)}): {raw_feature_cols}")
 
+print(raw_feature_cols)
 # Work on a copy for downstream processing.
 df_proc = df.copy()
 
@@ -229,67 +230,67 @@ def compute_knn_gaussian_edges_for_window(df_full, dates_window):
     """Compute kNN + Gaussian edges for a given time window."""
     # Construct feature matrix [Nodes, Time * Features]
     feature_matrices = []
-    
+
     # take subset
     sub = df_full[df_full[DATE_COL].isin(dates_window)].copy()
-    
+
     for feat in raw_feature_cols:
         # Pivot: [Time, Nodes]
         pivot = sub.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feat).fillna(0)
         # Ensure correct column order
         pivot = pivot.reindex(columns=unique_symbols, fill_value=0)
-        
+
         # Standardize using GLOBAL train stats
         mean_val, std_val = feat_stats[feat]
         vals_scaled = (pivot.values - mean_val) / std_val
-        
+
         # Transpose to [Nodes, Time] and append
         feature_matrices.append(vals_scaled.T)
-        
+
     # Concatenate features: [Nodes, Time * Num_Features]
     Pts = np.concatenate(feature_matrices, axis=1)
-    
+
     # kNN search
     # We need k+1 neighbors (including self)
     # Using 'euclidean' metric
     nbrs = NearestNeighbors(n_neighbors=KNN_K + 1, algorithm='auto', metric='euclidean').fit(Pts)
     distances, indices = nbrs.kneighbors(Pts)
-    
+
     # Gaussian similarity
     # Local scaling sigma: distance to the k-th neighbor
     sigmas = distances[:, KNN_K]
-    
+
     new_edges = {} # (u, v) -> weight
-    
+
     for i in range(num_nodes):
         sigma_i = sigmas[i] if sigmas[i] > 0 else 1e-12
-        
+
         for k_idx in range(1, KNN_K + 1):
             j = indices[i, k_idx]
             d = distances[i, k_idx]
-            
+
             # Skip self-loops
             if i == j: continue
-            
+
             sigma_j = sigmas[j] if sigmas[j] > 0 else 1e-12
-            
+
             # Symmetric Sigma
             sigma_edge = max(sigma_i, sigma_j)
-            
+
             # Gaussian similarity (weights)
             # s_i(j) = exp(-4 * (d_i(j)^2) / (sigma_i(j)^2))
             w = np.exp(-4 * (d**2) / (sigma_edge**2))
-            
+
             # Enforce symmetry by storing ordered pair
             u, v = (i, j) if i < j else (j, i)
-            
+
             # If multiple directions/occurrences in same window (unlikely for kNN unless symmetric), max or avg?
             # take max weight if both see each other (or overwrite).
             if (u, v) in new_edges:
                 new_edges[(u, v)] = max(new_edges[(u, v)], w)
             else:
                 new_edges[(u, v)] = w
-                
+
     return new_edges
 
 
@@ -671,3 +672,57 @@ print(f"Recall:    {recall_score(test_true, final_preds, zero_division=0):.4f}")
 print(f"F1 Score:  {f1_score(test_true, final_preds, zero_division=0):.4f}")
 print("Confusion Matrix:")
 print(confusion_matrix(test_true, final_preds))
+
+# ----------------------------
+# 12) METRICHE PER TOKEN (solo token con pump nel TEST >= 3)  <<< ADDED
+# ----------------------------
+@torch.no_grad()
+def collect_per_token_predictions(loader, thresh=0.5):
+    model.eval()
+    token_to_true = {}
+    token_to_pred = {}
+
+    for batch in loader:
+        batch = batch.to(device)
+        probs = model(batch.x, batch.edge_index, batch.edge_attr)
+        preds = (probs >= thresh).long()
+
+        # Ogni snapshot ha sempre N nodi nello stesso ordine (0..N-1).
+        # Nel batch concatenato, l'indice "locale" del nodo è (global_idx % num_nodes).
+        node_global_idx = torch.arange(batch.x.size(0), device=device)
+        node_local_idx = (node_global_idx % num_nodes).long()
+
+        masked_idx = batch.mask.nonzero(as_tuple=False).view(-1)
+        masked_local = node_local_idx[masked_idx].detach().cpu().numpy()
+        masked_true  = batch.y[masked_idx].detach().cpu().numpy().astype(int)
+        masked_pred  = preds[masked_idx].detach().cpu().numpy().astype(int)
+
+        for li, yt, yp in zip(masked_local, masked_true, masked_pred):
+            sym = idx_to_symbol[int(li)]
+            token_to_true.setdefault(sym, []).append(int(yt))
+            token_to_pred.setdefault(sym, []).append(int(yp))
+
+    return token_to_true, token_to_pred
+
+token_to_true, token_to_pred = collect_per_token_predictions(test_loader, thresh=FIXED_THRESHOLD)
+
+eligible_tokens = []
+for sym, ys in token_to_true.items():
+    if int(np.sum(np.array(ys) == 1)) >= 3:
+        eligible_tokens.append(sym)
+
+print("\n--- Metriche per Token (solo token con >=3 pump nel TEST) ---")
+if not eligible_tokens:
+    print("Nessun token con >=3 pump nel test set.")
+else:
+    for sym in sorted(eligible_tokens):
+        ys = np.array(token_to_true[sym], dtype=int)
+        ps = np.array(token_to_pred[sym], dtype=int)
+
+        p = precision_score(ys, ps, zero_division=0)
+        r = recall_score(ys, ps, zero_division=0)
+        f = f1_score(ys, ps, zero_division=0)
+        pumps = int(np.sum(ys == 1))
+        n_obs = int(len(ys))
+
+        print(f"{sym} | n={n_obs} | pumps={pumps} | Precision={p:.4f} | Recall={r:.4f} | F1={f:.4f}")

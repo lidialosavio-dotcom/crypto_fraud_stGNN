@@ -73,7 +73,7 @@ def set_seed(seed=44):
     os.environ["PYTHONHASHSEED"] = str(seed)
     print(f"Seed fixed to {seed}.")
 
-set_seed(55)
+set_seed(11)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -121,7 +121,7 @@ USE_ABS_FOR_NEW_EDGES = False    # True => add edges also for strong negative co
 HIDDEN_CHANNELS = 64
 HEADS = 2
 LEARNING_RATE = 0.001
-EPOCHS = 100
+EPOCHS = 50
 DROPOUT = 0.4
 BATCH_SIZE = 64
 
@@ -135,7 +135,6 @@ LABEL_COL  = "flag"
 GROUP_COL  = "symbol"
 
 # Columns excluded from feature selection (targets, identifiers, non-feature columns).
-# TODO: The feature selection has to be part of the script.
 DROP_COLS_TRAIN = [
     DATE_COL, LABEL_COL, GROUP_COL,
     "high", "low", "close", "group",
@@ -160,6 +159,7 @@ df[LABEL_COL] = df[LABEL_COL].astype(int).clip(0, 1)
 # Define the node universe as the set of unique symbols; map each symbol to an index.
 unique_symbols = df[GROUP_COL].unique()
 symbol_to_idx = {sym: i for i, sym in enumerate(unique_symbols)}
+idx_to_symbol = {i: sym for sym, i in symbol_to_idx.items()}  # <<< ADDED (needed for per-token metrics)
 num_nodes = len(unique_symbols)
 print(f"Dataset: {len(df)} righe, {num_nodes} token unici.")
 
@@ -226,17 +226,6 @@ pump_dates = pd.DatetimeIndex(pump_dates).sort_values()
 
 print(f"Pump events nel TRAIN: {len(pump_dates)} (timestamps unici)")
 
-#BEFORE
-# def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
-#     """Restituisce le date nel train nella finestra [pump-48, pump+48] (clippata)."""
-#     pos = train_dates_index.searchsorted(pump_date)
-#     if pos == len(train_dates_index) or train_dates_index[pos] != pump_date:
-#         pos = max(0, pos - 1)
-
-#     left = max(0, pos - window_h)
-#     right = min(len(train_dates_index) - 1, pos + window_h)
-#     return train_dates_index[left:right+1]
-
 def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
     """Return the TRAIN timestamps within the window [pump-48, pump] (clipped)."""
     # Locate the pump timestamp position in the sorted train index.
@@ -248,7 +237,7 @@ def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW
     # Clip left boundary within valid train index bounds.
     left = max(0, pos - window_h)
 
-    # IMPORTANT: to avoid leakage, we updated the code so that the right boundary is the pump itself (no future).
+    # IMPORTANT: to avoid leakage, the right boundary is the pump itself (no future).
     right = pos
 
     return train_dates_index[left:right+1]
@@ -722,3 +711,57 @@ print(f"F1 Score:  {f1_score(test_true, final_preds, zero_division=0):.4f}")
 print("Confusion Matrix:")
 print(confusion_matrix(test_true, final_preds))
 
+# ----------------------------
+# 12) METRICHE PER TOKEN (solo token con >3 pump nel TEST)  <<< ADDED (identica al primo file)
+# ----------------------------
+@torch.no_grad()
+def collect_per_token_predictions(loader, thresh=0.5):
+    model.eval()
+    token_to_true = {}
+    token_to_pred = {}
+
+    for batch in loader:
+        batch = batch.to(device)
+        probs = model(batch.x, batch.edge_index, batch.edge_attr)
+        preds = (probs >= thresh).long()
+
+        # Ogni snapshot ha sempre N nodi nello stesso ordine (0..N-1).
+        # Nel batch concatenato, l'indice "locale" del nodo è (global_idx % num_nodes).
+        node_global_idx = torch.arange(batch.x.size(0), device=device)
+        node_local_idx = (node_global_idx % num_nodes).long()
+
+        masked_idx = batch.mask.nonzero(as_tuple=False).view(-1)
+        masked_local = node_local_idx[masked_idx].detach().cpu().numpy()
+        masked_true  = batch.y[masked_idx].detach().cpu().numpy().astype(int)
+        masked_pred  = preds[masked_idx].detach().cpu().numpy().astype(int)
+
+        for li, yt, yp in zip(masked_local, masked_true, masked_pred):
+            sym = idx_to_symbol[int(li)]
+            token_to_true.setdefault(sym, []).append(int(yt))
+            token_to_pred.setdefault(sym, []).append(int(yp))
+
+    return token_to_true, token_to_pred
+
+token_to_true, token_to_pred = collect_per_token_predictions(test_loader, thresh=FIXED_THRESHOLD)
+
+# token "attaccati" più di 3 volte nel test: count(flag==1) >= 3
+eligible_tokens = []
+for sym, ys in token_to_true.items():
+    if int(np.sum(np.array(ys) == 1)) >= 3:
+        eligible_tokens.append(sym)
+
+print("\n--- Metriche per Token (solo token con >3 pump nel TEST) ---")
+if not eligible_tokens:
+    print("Nessun token con più di 3 pump nel test set.")
+else:
+    for sym in sorted(eligible_tokens):
+        ys = np.array(token_to_true[sym], dtype=int)
+        ps = np.array(token_to_pred[sym], dtype=int)
+
+        p = precision_score(ys, ps, zero_division=0)
+        r = recall_score(ys, ps, zero_division=0)
+        f = f1_score(ys, ps, zero_division=0)
+        pumps = int(np.sum(ys == 1))
+        n_obs = int(len(ys))
+
+        print(f"{sym} | n={n_obs} | pumps={pumps} | Precision={p:.4f} | Recall={r:.4f} | F1={f:.4f}")
