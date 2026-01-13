@@ -1,11 +1,25 @@
+"""
+Created on Fri Dec 12 17:15:01 2025
+
+This is a downloader for the report "Detecting Pump-and-Dump Schemes in Crypto
+Markets". The goal is to fetch market information for tickers 
+involved in a Pump&Dump scheme using the Binance API. The tickers are reported 
+in the file pump_telegram.csv collected by the System Lab Sapienza.
+
+Reference: 'https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset/tree/master'
+
+Author: Lidia Losavio (USI), Luca Persia (USI/ZHAW)
+
+Note: the downaloader is currently handling ONLY /BTC currency pair.
+"""
+
 import time
 import requests
 import pandas as pd
 
-# note: spot prices only
-BASE = "https://api.binance.com" 
+BASE = "https://api.binance.com"  # spot
 
-# note: we get historical data at max 1s granularity, this is not for tick data
+
 def fetch_klines(
     symbol: str,
     interval: str,
@@ -17,8 +31,9 @@ def fetch_klines(
     backoff_s: float = 15.0,
     timeout_s: float = 30.0,
 ) -> pd.DataFrame:
+    
     """
-    Fetch historical OHLCV candles (klines) from BINANCE Spot REST API.
+    Fetch historical OHLCV candles from BINANCE Spot REST API.
 
     Input
     -----
@@ -27,13 +42,13 @@ def fetch_klines(
     interval : str
         Candle frequency supported by Binance, e.g. '1m', '5m', '1h', '1d'.
     start_ms : int
-        Start time (UTC).
+        Start time in milliseconds since epoch (UTC).
     end_ms : int
-        End time (UTC).
+        End time in milliseconds since epoch (UTC).
     limit : int, optional
         Max candles per API call (Binance default max is 1000).
     sleep_s : float, optional
-        Sleep between requests.
+        Sleep between requests (politeness / avoid throttling).
     backoff_s : float, optional
         Sleep time when rate-limited (HTTP 429).
     timeout_s : float, optional
@@ -54,6 +69,7 @@ def fetch_klines(
         - ignore
         If no data is available in the requested window, returns an empty DataFrame.
     """
+    
     url = f"{BASE}/api/v3/klines"
     out = []
     since = start_ms
@@ -67,26 +83,26 @@ def fetch_klines(
             "limit": limit,
         }
         r = requests.get(url, params=params, timeout=timeout_s)
-
         if r.status_code == 429:
             time.sleep(backoff_s)
             continue
-
         r.raise_for_status()
         batch = r.json()
         if not batch:
             break
-
         out.extend(batch)
         since = batch[-1][6] + 1  # last close_time + 1 ms
         time.sleep(sleep_s)
 
+    # Note: aggregated information
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "num_trades",
         "taker_buy_base", "taker_buy_quote", "ignore",
     ]
+    
     df = pd.DataFrame(out, columns=cols)
+    
     if df.empty:
         return df
 
@@ -98,5 +114,5 @@ def fetch_klines(
         "quote_asset_volume", "taker_buy_base", "taker_buy_quote",
     ]
     df[num_cols] = df[num_cols].astype(float)
+    
     return df
-  
