@@ -5,6 +5,13 @@ This section documents how we build the **panel datasets** used for pump-and-dum
 
 ### Input
 - `pump_telegram.csv` (minimum columns used): `symbol`, `exchange`, `date` (`YYYY-mm-dd`), `hour` (`HH:MM`)
+   Each row of this file contains:
+  - symbol: the symbol (SYM) of the pumped coin.
+  - group: the code of the group that arranged the pump and dump. More information about the groups can the found in the group.csv file
+  - date: the pump and dump date
+  - hour: the pump and dump hour expressed in UTC
+  - exchange: the exchange targeted by the group
+  All the pump and dumps in the dataset are on the trading pair SYM/BTC.
 - Only rows where `exchange` matches `--exchange-filter` (default: `binance`) are used.
 - Binance REST symbol is built as `symbol + quote` (we specifically only use quote: `BTC`, e.g. `ETHBTC`).
 
