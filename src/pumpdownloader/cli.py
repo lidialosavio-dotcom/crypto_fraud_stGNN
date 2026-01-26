@@ -33,16 +33,18 @@ def _add_args(p: argparse.ArgumentParser) -> None:
     # Legacy single output
     p.add_argument("--out", default=None, help="(legacy) Write only the engineered multi-pump global panel")
 
-    # Updated multi-output paths
-    p.add_argument("--out-base", default=None, help="Write GLOBAL multi-pump base panel CSV")
-    p.add_argument("--out-engineered", default=None, help="Write GLOBAL multi-pump engineered panel CSV")
-    p.add_argument("--out-single-base", default=None, help="Write GLOBAL single-pump base panel CSV")
-    p.add_argument("--out-single-engineered", default=None, help="Write GLOBAL single-pump engineered panel CSV")
+    # Updated multi-output paths    
+    p.add_argument(
+    "--window-mode",
+    choices=["per_token", "dataset_global", "both"],
+    default="per_token",
+    help="Window definition: per-token, dataset-global, or both.")
 
-    p.add_argument("--out-base-w3", default=None, help="Write WINDOWED(+/-window_days) multi-pump base panel CSV")
-    p.add_argument("--out-engineered-w3", default=None, help="Write WINDOWED(+/-window_days) multi-pump engineered panel CSV")
-    p.add_argument("--out-single-base-w3", default=None, help="Write WINDOWED(+/-window_days) single-pump base panel CSV")
-    p.add_argument("--out-single-engineered-w3", default=None, help="Write WINDOWED(+/-window_days) single-pump engineered panel CSV")
+    # When window-mode=both, use these
+    p.add_argument("--out-base-token", default=None, help="Write per-token base panel CSV")
+    p.add_argument("--out-engineered-token", default=None, help="Write per-token engineered panel CSV")
+    p.add_argument("--out-base-global", default=None, help="Write dataset-global base panel CSV")
+    p.add_argument("--out-engineered-global", default=None, help="Write dataset-global engineered panel CSV")
 
     # Panel configuration
     p.add_argument("--interval", default="1h")
@@ -118,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         Exit code (0 for success).
     """
     
-    ap = argparse.ArgumentParser(prog="pumpdownloader")
+    ap = argparse.ArgumentParser(prog="pumpdownloader", allow_abbrev=False)
     _add_args(ap)
     args = ap.parse_args(argv)
 
@@ -135,12 +137,14 @@ def main(argv: list[str] | None = None) -> int:
 
     input_csv = Path(args.input)
 
-    # Detect whether the user requested any of the new multi-output flags
+    # Detect whether requests is any of the new multi-output flags
     wants_multi_out = any(
         getattr(args, k) is not None
         for k in (
-            "out_base", "out_engineered", "out_single_base", "out_single_engineered",
-            "out_base_w3", "out_engineered_w3", "out_single_base_w3", "out_single_engineered_w3",
+            "out_base_token",
+            "out_engineered_token",
+            "out_base_global",
+            "out_engineered_global",
         )
     )
 
@@ -148,26 +152,40 @@ def main(argv: list[str] | None = None) -> int:
     if (not wants_multi_out) and (args.out is not None):
         out = Path(args.out)
         _ensure_parent_dir(out)
-
-        df = build_panel(input_csv, cfg)
+        # here the deterministic choice is per_token
+        df = build_panel(input_csv, cfg, 
+                         window_mode=args.window_mode if args.window_mode != "both" else "per_token")
         df.to_csv(out, index=False)
         print(f"[WRITE] {out}  rows={len(df):,}")
         return 0
 
-    # Updated: build all panels according to output provided
-    outs = build_panels(input_csv, cfg)
-
-    _write_panel_csv(args.out_base, outs, "panel_base")
-    _write_panel_csv(args.out_engineered, outs, "panel_engineered")
-    _write_panel_csv(args.out_single_base, outs, "single_pump_base")
-    _write_panel_csv(args.out_single_engineered, outs, "single_pump_engineered")
-
-    _write_panel_csv(args.out_base_w3, outs, "panel_base_w")
-    _write_panel_csv(args.out_engineered_w3, outs, "panel_engineered_w")
-    _write_panel_csv(args.out_single_base_w3, outs, "single_pump_base_w")
-    _write_panel_csv(args.out_single_engineered_w3, outs, "single_pump_engineered_w")
+    # build panels
+    outs = build_panels(input_csv, cfg, window_mode=args.window_mode)
+    if args.window_mode == "both":
+        # Require at least one of the both-mode outputs
+        if not wants_multi_out:
+            ap.error("window-mode=both requires at least one of: "
+                     "--out-base-token/--out-engineered-token/--out-base-global/--out-engineered-global")
+    
+        _write_panel_csv(args.out_base_token, outs, "panel_base_token")
+        _write_panel_csv(args.out_engineered_token, outs, "panel_engineered_token")
+        _write_panel_csv(args.out_base_global, outs, "panel_base_global")
+        _write_panel_csv(args.out_engineered_global, outs, "panel_engineered_global")
+    
+    else:
+        # Single mode -> keep a single pair of outputs (token OR global depending on window-mode)
+        # If you still have --out-base/--out-engineered CLI, use them here.
+        # If not, keep legacy --out or define single-mode outputs.
+        if args.out is not None:
+            out = Path(args.out)
+            _ensure_parent_dir(out)
+            df = build_panel(input_csv, cfg, window_mode=args.window_mode)
+            df.to_csv(out, index=False)
+            print(f"[WRITE] {out} rows={len(df):,}")
+        
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
