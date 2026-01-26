@@ -8,7 +8,7 @@ in the file pump_telegram.csv collected by the System Lab Sapienza.
 
 Reference: 'https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset/tree/master'
 
-Author: Lidia Losavio (USI), Luca Persia (USI/ZHAW)
+Author: Luca Persia (USI/ZHAW)
 
 Note: the downaloader is currently handling ONLY /BTC currency pair.
 """
