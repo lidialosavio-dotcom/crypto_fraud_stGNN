@@ -8,7 +8,7 @@ It follows the “change in rolling statistics” idea used in the Sapienza
 pump-and-dump dataset work: for each symbol, compute rolling mean/std over a
 window and then take the percentage change of that rolling statistic.
 
-Author: Lidia Losavio (USI), Luca Persia (USI/ZHAW)
+Author: Luca Persia (USI/ZHAW)
 """
 
 from __future__ import annotations
