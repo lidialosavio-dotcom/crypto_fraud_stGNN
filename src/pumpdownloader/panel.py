@@ -8,15 +8,9 @@ Panel builder for pump-and-dump datasets. This module builds two panel families:
       [global_first_pump - days_before, global_last_pump + days_after]
     Pump hours are flagged inside that global window.
 
-(B) WINDOWED panels
-    Stacked per-pump chunks per token:
-      for each pump time t, download [t-window_days, t+window_days]
-    Chunks are stacked and pump hours are flagged.
-    Rolling engineered features are computed per chunk in this case.
-
-We splits tokens into:
-  - multi-pump tokens (>= 2 pump events)
-  - single-pump tokens (= 1 pump event)
+(B) Per - Token panels
+    Each token has its own timeframe. The final dataset stacks all the tokens together.
+    The ideas is that some token could also be not traded at a specific point in time.
 
 Author: Lidia Losavio (USI), Luca Persia (USI/ZHAW)
 """
@@ -25,11 +19,12 @@ from __future__ import annotations
 import numpy as np, pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Tuple, Literal
 from zoneinfo import ZoneInfo
-from typing import Dict, List
 from pumpdownloader.binance import fetch_klines
 from pumpdownloader.features import add_pump_features
 
+WindowMode = Literal["per_token", "dataset_global", "both"]
 
 ### Config
 @dataclass(frozen=True)
@@ -175,26 +170,21 @@ def _to_utc_ms(ts: pd.Timestamp) -> int:
     return int(ts_utc.timestamp() * 1000)
 
 
-def _convert_open_time_to_cfg_tz(open_time_ms: pd.Series, 
+def _convert_open_time_to_cfg_tz(open_time_ms: pd.Series,
                                  cfg: PanelConfig) -> pd.Series:
-    
     """
-    Convert Binance open_time (ms UTC) to timezone-aware timestamps in cfg.timezone.
+    Convert Binance open_time to timezone-aware timestamps in cfg.timezone.
 
-    Input
-    -----
-    open_time_ms : pd.Series
-        Binance open_time values in ms since epoch.
-    cfg : PanelConfig
-        Panel configuration.
-
-    Output
-    ------
-    pd.Series
-        tz-aware datetime series in cfg.timezone.
+    Works with either:
+      - numeric milliseconds since epoch, or
+      - datetime-like inputs (fetch_klines already returns tz-aware timestamps).
     """
-    
-    dt = pd.to_datetime(open_time_ms, unit="ms", utc=True)
+    # Robust to numeric millisecond inputs *and* datetime-like inputs.
+    if pd.api.types.is_numeric_dtype(open_time_ms):
+        dt = pd.to_datetime(open_time_ms, unit="ms", utc=True)
+    else:
+        dt = pd.to_datetime(open_time_ms, utc=True)
+
     if cfg.timezone.upper() != "UTC":
         dt = dt.dt.tz_convert(ZoneInfo(cfg.timezone))
     return dt
@@ -270,337 +260,95 @@ def _fetch_token_panel(
     return kdf[BASE_COLS].copy()
 
 
-def _fetch_token_windows(
-    symbol_rest: str,
-    pump_times: np.ndarray,
-    cfg: PanelConfig,
-) -> pd.DataFrame:
-    
-    """
-    Download per-pump chunks for one token, stack them, flagging pump hours.
-
-    For each pump time t, download:
-      [t - cfg.window_days, t + cfg.window_days]
-
-    A chunk id is attached so engineered rolling features can be computed per chunk
-    without mixing different pump windows.
-
-    Input
-    -----
-    symbol_rest : str
-        Binance symbol without slash, e.g. "ETHBTC".
-    pump_times : np.ndarray
-        Pump timestamps for this token.
-    cfg : PanelConfig
-        Panel configuration.
-
-    Output
-    ------
-    pd.DataFrame
-        Base windowed panel with BASE_COLS + ["__chunk"].
-        Empty DataFrame if nothing was fetched.
-    """
-    
-    pts = _pump_times_in_cfg_tz(pump_times, cfg)
-
-    frames: List[pd.DataFrame] = []
-    for t in pts:
-        start = t - pd.Timedelta(days=cfg.window_days)
-        end = t + pd.Timedelta(days=cfg.window_days)
-
-        kdf = fetch_klines(symbol_rest, cfg.interval, _to_utc_ms(start), _to_utc_ms(end), limit=1000)
-        if kdf.empty:
-            continue
-
-        kdf["symbol"] = symbol_rest
-        kdf["date"] = _convert_open_time_to_cfg_tz(kdf["open_time"], cfg)
-        kdf["flag"] = kdf["date"].isin(pts).astype(int)
-
-        # Unique chunk id per pump event
-        kdf["__chunk"] = f"{symbol_rest}||{t.isoformat()}"
-
-        frames.append(kdf[BASE_COLS + ["__chunk"]].copy())
-
-    if not frames:
-        return pd.DataFrame(columns=BASE_COLS + ["__chunk"])
-
-    out = pd.concat(frames, ignore_index=True)
-    out = out.sort_values(["__chunk", "date"]).reset_index(drop=True)
-    return out
-
-
-# Feature engineering for windowed panels
-def _engineer_per_chunk(window_df_with_chunk: pd.DataFrame, *, 
-                        window: int = 12) -> pd.DataFrame:
-    
-    """
-    Compute engineered rolling features per chunk (no mixing across pump windows).
-    add_pump_features() computes rolling stats grouped by "symbol".
-    For windowed data we want grouping by chunk, not by token.
-    We temporarily set:
-      symbol := chunk_id
-    so the feature function groups per chunk, then restore symbol afterwards.
-
-    Input
-    -----
-    window_df_with_chunk : pd.DataFrame
-        DataFrame with BASE_COLS + ["__chunk"].
-    window : int, default=12
-        Rolling window size in rows (hours if interval="1h").
-
-    Output
-    ------
-    pd.DataFrame
-        Engineered panel with BASE_COLS + engineered features (no __chunk).
-    """
-    
-    if window_df_with_chunk.empty:
-        return window_df_with_chunk.drop(columns=["__chunk"], errors="ignore").copy()
-
-    dfw = window_df_with_chunk.copy()
-    dfw = dfw.sort_values(["__chunk", "date"]).reset_index(drop=True)
-
-    # Stable row id to restore symbol even
-    dfw["__rowid"] = np.arange(len(dfw), dtype=np.int64)
-    dfw["__token_symbol"] = dfw["symbol"].astype(str)
-
-    out_parts: List[pd.DataFrame] = []
-
-    for chunk_id, g in dfw.groupby("__chunk", sort=False):
-        g = g.sort_values("date").copy()
-
-        # Force grouping in add_pump_features() to be per chunk
-        g["symbol"] = chunk_id
-
-        eng = add_pump_features(g, window=window)
-
-        # Restore token symbol
-        if "__token_symbol" in eng.columns:
-            eng["symbol"] = eng["__token_symbol"].astype(str)
-        else:
-            eng = eng.merge(
-                g[["__rowid", "__token_symbol"]],
-                on="__rowid",
-                how="left",
-                validate="one_to_one",
-            )
-            eng["symbol"] = eng["__token_symbol"].astype(str)
-
-        # Drop internal helper columns
-        eng = eng.drop(columns=["__chunk", "__token_symbol"], errors="ignore")
-        out_parts.append(eng)
-
-    engineered = pd.concat(out_parts, ignore_index=True)
-    engineered = engineered.sort_values(["date", "symbol"]).reset_index(drop=True)
-    return engineered
-
-
-### Buld panels here
-def build_panels(csv_path: Path, cfg: PanelConfig) -> Dict[str, pd.DataFrame]:
-    
-    """
-    Build and return all panels.
-
-    Panels returned
-    ---------------
-    GLOBAL (single window per token):
-      - panel_base
-      - panel_engineered
-      - single_pump_base
-      - single_pump_engineered
-
-    WINDOWED (stacked per-pump chunks):
-      - panel_base_w
-      - panel_engineered_w
-      - single_pump_base_w
-      - single_pump_engineered_w
-
-    Input
-    -----
-    csv_path : Path
-        Path to pump_telegram.csv.
-    cfg : PanelConfig
-        Panel configuration.
-
-    Output
-    ------
-    Dict[str, pd.DataFrame]
-        Dictionary mapping keys above to DataFrames.
-    """
+def build_panels(csv_path: Path, cfg: PanelConfig, *, window_mode: WindowMode = "dataset_global") -> Dict[str, pd.DataFrame]:
     src = pd.read_csv(csv_path)
 
     pumps = src[src["exchange"].astype(str).str.lower() == cfg.exchange_filter.lower()].copy()
     if pumps.empty:
         empty_base = pd.DataFrame(columns=BASE_COLS)
-        return {
-            "panel_base": empty_base,
-            "panel_engineered": empty_base.copy(),
-            "single_pump_base": empty_base.copy(),
-            "single_pump_engineered": empty_base.copy(),
-            "panel_base_w": empty_base.copy(),
-            "panel_engineered_w": empty_base.copy(),
-            "single_pump_base_w": empty_base.copy(),
-            "single_pump_engineered_w": empty_base.copy(),
-        }
+        if window_mode == "both":
+            return {
+                "panel_base_token": empty_base.copy(),
+                "panel_engineered_token": empty_base.copy(),
+                "panel_base_global": empty_base.copy(),
+                "panel_engineered_global": empty_base.copy(),
+            }
+        return {"panel_base": empty_base, "panel_engineered": empty_base.copy()}
 
-    # Binance REST symbol (ETH + BTC => ETHBTC)
     pumps["symbol_rest"] = pumps["symbol"].astype(str) + cfg.quote
 
-    # Pump timestamp
     pumps["pump_time"] = pumps.apply(
         lambda r: _pump_time(r, cfg.timezone, interval=cfg.interval, do_round=cfg.round_pump_time),
         axis=1,
     )
 
-    # Split tokens by pump count
-    counts = pumps.groupby("symbol_rest").size()
-    multi_syms = counts[counts >= 2].index.tolist()
-    single_syms = counts[counts == 1].index.tolist()
+    pumps = pumps.drop_duplicates(subset=["symbol_rest", "pump_time"])
 
-    print(f"[TOKENS] multi-pump (>=2): {len(multi_syms)} | single-pump (=1): {len(single_syms)}")
+    grouped = pumps.groupby("symbol_rest", sort=True)
+    symbols = list(grouped.groups.keys())
+    print(f"[TOKENS]: {len(symbols)}")
 
-    # Global window boundaries
-    global_min = pumps["pump_time"].min()
-    global_max = pumps["pump_time"].max()
+    td_before = pd.Timedelta(days=cfg.days_before)
+    td_after = pd.Timedelta(days=cfg.days_after)
 
-    start = global_min - pd.Timedelta(days=cfg.days_before)
-    end = global_max + pd.Timedelta(days=cfg.days_after)
+    global_start = pumps["pump_time"].min() - td_before
+    global_end = pumps["pump_time"].max() + td_after
 
-    start_ms = _to_utc_ms(start)
-    end_ms = _to_utc_ms(end)
+    def _build_base(mode: Literal["per_token", "dataset_global"]) -> pd.DataFrame:
+        failures = 0
+        frames: List[pd.DataFrame] = []
 
-    print(f"[WINDOW] GLOBAL: {start} -> {end}  (before={cfg.days_before}, after={cfg.days_after})")
-    print(f"[WINDOW] PER-PUMP: +/- {cfg.window_days} days")
+        for sym, gsym in grouped:
+            try:
+                pts = gsym["pump_time"].to_numpy()
 
-    failures = 0
+                if mode == "per_token":
+                    start = gsym["pump_time"].min() - td_before
+                    end = gsym["pump_time"].max() + td_after
+                else:
+                    start = global_start
+                    end = global_end
 
-    # GLOBAL panels
-    multi_frames: List[pd.DataFrame] = []
-    single_frames: List[pd.DataFrame] = []
+                df_sym = _fetch_token_panel(sym, pts, cfg, _to_utc_ms(start), _to_utc_ms(end))
+                if not df_sym.empty:
+                    frames.append(df_sym)
 
-    for sym in multi_syms:
-        try:
-            pts = pumps.loc[pumps["symbol_rest"] == sym, "pump_time"].to_numpy()
-            df_sym = _fetch_token_panel(sym, pts, cfg, start_ms, end_ms)
-            if not df_sym.empty:
-                multi_frames.append(df_sym)
-        except Exception as e:
-            failures += 1
-            print(f"[WARN] Failed (GLOBAL) {sym}: {e}")
+            except Exception as e:
+                failures += 1
+                print(f"[WARN] Failed ({mode}) {sym}: {e}")
 
-    for sym in single_syms:
-        try:
-            pts = pumps.loc[pumps["symbol_rest"] == sym, "pump_time"].to_numpy()
-            df_sym = _fetch_token_panel(sym, pts, cfg, start_ms, end_ms)
-            if not df_sym.empty:
-                single_frames.append(df_sym)
-        except Exception as e:
-            failures += 1
-            print(f"[WARN] Failed (GLOBAL) {sym}: {e}")
+        if failures:
+            print(f"[INFO] Completed {mode} with {failures} failures.")
 
-    panel_base = (
-        pd.concat(multi_frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
-        if multi_frames else pd.DataFrame(columns=BASE_COLS)
-    )
-    single_pump_base = (
-        pd.concat(single_frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
-        if single_frames else pd.DataFrame(columns=BASE_COLS)
-    )
+        if not frames:
+            return pd.DataFrame(columns=BASE_COLS)
 
-    panel_engineered = add_pump_features(panel_base, window=12) if not panel_base.empty else panel_base.copy()
-    single_pump_engineered = (
-        add_pump_features(single_pump_base, window=12) if not single_pump_base.empty else single_pump_base.copy()
-    )
+        return (
+            pd.concat(frames, ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+        )
 
-    # WINDOWED panels
-    multi_w_frames: List[pd.DataFrame] = []
-    single_w_frames: List[pd.DataFrame] = []
+    if window_mode in ("per_token", "dataset_global"):
+        base = _build_base(window_mode)
+        engineered = add_pump_features(base, window=12) if not base.empty else base.copy()
+        return {"panel_base": base, "panel_engineered": engineered}
 
-    for sym in multi_syms:
-        try:
-            pts = pumps.loc[pumps["symbol_rest"] == sym, "pump_time"].to_numpy()
-            df_w = _fetch_token_windows(sym, pts, cfg)
-            if not df_w.empty:
-                multi_w_frames.append(df_w)
-        except Exception as e:
-            failures += 1
-            print(f"[WARN] Failed (WINDOWED) {sym}: {e}")
+    # both
+    base_token = _build_base("per_token")
+    eng_token = add_pump_features(base_token, window=12) if not base_token.empty else base_token.copy()
 
-    for sym in single_syms:
-        try:
-            pts = pumps.loc[pumps["symbol_rest"] == sym, "pump_time"].to_numpy()
-            df_w = _fetch_token_windows(sym, pts, cfg)
-            if not df_w.empty:
-                single_w_frames.append(df_w)
-        except Exception as e:
-            failures += 1
-            print(f"[WARN] Failed (WINDOWED) {sym}: {e}")
-
-    panel_base_w_raw = (
-        pd.concat(multi_w_frames, ignore_index=True).reset_index(drop=True)
-        if multi_w_frames else pd.DataFrame(columns=BASE_COLS + ["__chunk"])
-    )
-    single_pump_base_w_raw = (
-        pd.concat(single_w_frames, ignore_index=True).reset_index(drop=True)
-        if single_w_frames else pd.DataFrame(columns=BASE_COLS + ["__chunk"])
-    )
-
-    # Base window outputs should not include __chunk
-    panel_base_w = (
-        panel_base_w_raw.drop(columns=["__chunk"], errors="ignore")
-        .sort_values(["date", "symbol"]).reset_index(drop=True)
-        if not panel_base_w_raw.empty else pd.DataFrame(columns=BASE_COLS)
-    )
-    single_pump_base_w = (
-        single_pump_base_w_raw.drop(columns=["__chunk"], errors="ignore")
-        .sort_values(["date", "symbol"]).reset_index(drop=True)
-        if not single_pump_base_w_raw.empty else pd.DataFrame(columns=BASE_COLS)
-    )
-
-    # Engineered features computed per chunk
-    panel_engineered_w = (
-        _engineer_per_chunk(panel_base_w_raw, window=12) if not panel_base_w_raw.empty else panel_base_w.copy()
-    )
-    single_pump_engineered_w = (
-        _engineer_per_chunk(single_pump_base_w_raw, window=12) if not single_pump_base_w_raw.empty else single_pump_base_w.copy()
-    )
-
-    if failures:
-        print(f"[INFO] Completed with {failures} failures.")
-
-    print(f"[DONE] GLOBAL  multi rows={len(panel_base):,} | engineered rows={len(panel_engineered):,}")
-    print(f"[DONE] GLOBAL  single rows={len(single_pump_base):,} | engineered rows={len(single_pump_engineered):,}")
-    print(f"[DONE] WINDOW multi rows={len(panel_base_w):,} | engineered rows={len(panel_engineered_w):,}")
-    print(f"[DONE] WINDOW single rows={len(single_pump_base_w):,} | engineered rows={len(single_pump_engineered_w):,}")
+    base_global = _build_base("dataset_global")
+    eng_global = add_pump_features(base_global, window=12) if not base_global.empty else base_global.copy()
 
     return {
-        "panel_base": panel_base,
-        "panel_engineered": panel_engineered,
-        "single_pump_base": single_pump_base,
-        "single_pump_engineered": single_pump_engineered,
-        "panel_base_w": panel_base_w,
-        "panel_engineered_w": panel_engineered_w,
-        "single_pump_base_w": single_pump_base_w,
-        "single_pump_engineered_w": single_pump_engineered_w,
+        "panel_base_token": base_token,
+        "panel_engineered_token": eng_token,
+        "panel_base_global": base_global,
+        "panel_engineered_global": eng_global,
     }
 
 
-def build_panel(csv_path: Path, cfg: PanelConfig) -> pd.DataFrame:
-    """
-    Backward-compatible helper: return GLOBAL engineered multi-pump dataset.
-
-    Input
-    -----
-    csv_path : Path
-        Path to pump_telegram.csv.
-    cfg : PanelConfig
-        Panel configuration.
-
-    Output
-    ------
-    pd.DataFrame
-        Engineered global multi-pump panel.
-    """
-    
-    outs = build_panels(csv_path, cfg)
-    return outs["panel_engineered"]
+def build_panel(csv_path: Path, cfg: PanelConfig, *, window_mode: Literal["per_token", "dataset_global"] = "dataset_global") -> pd.DataFrame:
+    outs = build_panels(csv_path, cfg, window_mode=window_mode)
+    return outs["panel_engineered"]["panel_engineered"]
