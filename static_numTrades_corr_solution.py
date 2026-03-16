@@ -1,3 +1,4 @@
+
 import numpy as np
 import pandas as pd
 import warnings
@@ -87,28 +88,18 @@ SEEDS = [11, 22, 33, 44, 55, 66, 77, 88, 99]
 SPLIT_TRAIN = 0.60
 SPLIT_VAL   = 0.20
 SPLIT_TEST  = 0.20
-
 EMBARGO_STEPS = 5
+
 WINDOW_SIZE = 5
 
 MIN_CORR_THRESHOLD = 0.15
-TARGET_DENSITY = 0.95
-
-# ----------------------------
-# DYNAMIC GRAPH CONFIG
-# ----------------------------
-PUMP_WINDOW_HOURS = 12
-CORR_FEATURE = "volume"
-CORR_METHOD = "pearson"
-
-UPDATE_EXISTING_WITH_LOW_CORR = True
-USE_ABS_FOR_NEW_EDGES = False
+TARGET_DENSITY = 0.90
 
 HIDDEN_CHANNELS = 64
 HEADS = 2
 LEARNING_RATE = 0.001
 EPOCHS = 50
-DROPOUT = 0.2
+DROPOUT = 0.3
 BATCH_SIZE = 64
 
 # Not used anymore as the main threshold; kept as fallback
@@ -127,16 +118,16 @@ DROP_COLS_TRAIN = [
 # ----------------------------
 # OUTPUT DIR
 # ----------------------------
-OUTPUT_ROOT = "metrics_outputs_timing"
+OUTPUT_ROOT = "metrics_outputs_static_num_trades"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-GRID_RESULTS_FILE = "grid_results_dynamic_volume_timing.csv"
-GRID_SUMMARY_FILE = "grid_summary_dynamic_volume_timing.csv"
-GRID_PER_TOKEN_FILE = "grid_per_token_results_dynamic_volume_timing.csv"
+GRID_RESULTS_FILE = "grid_results_static_num_trades.csv"
+GRID_SUMMARY_FILE = "grid_summary_static_num_trades.csv"
+GRID_PER_TOKEN_FILE = "grid_per_token_results_static_num_trades.csv"
 
 
 # ----------------------------
-# 3) LOAD DATA 
+# 3) LOAD DATA
 # ----------------------------
 file_path = r"/home/lidialosav/pump-and-dump-dataset/project/panel_engineered_full.opt.parquet"
 
@@ -164,7 +155,6 @@ raw_feature_cols = [
     if c not in DROP_COLS_TRAIN and np.issubdtype(df[c].dtype, np.number)
 ]
 print(f"Selected Features ({len(raw_feature_cols)}): {raw_feature_cols}")
-
 df_proc = df.copy()
 
 # ----------------------------
@@ -182,202 +172,84 @@ dates_test  = unique_dates[val_end_idx + EMBARGO_STEPS :]
 print(f"Train: {len(dates_train)} h | Val: {len(dates_val)} h | Test: {len(dates_test)} h")
 
 # ----------------------------
-# 6) DYNAMIC GRAPH (correlation updates on windows around pump events in TRAIN)
+# 6) STATIC GRAPH (CORRELATION on volume)
 # ----------------------------
-print()
-print("--- Building DYNAMIC Graph (Correlation on pump windows) ---")
+print("\n--- Building Graph (Correlation) ---")
 
-base_edge_index = torch.tensor([list(range(num_nodes)), list(range(num_nodes))], dtype=torch.long)
-base_edge_attr  = torch.ones(num_nodes, dtype=torch.float)
+df_structure = df[df[DATE_COL].isin(dates_train)].copy()
 
-df_train = df[df[DATE_COL].isin(dates_train)].copy()
+if "num_trades" not in df_structure.columns:
+    raise ValueError("Column 'num_trades' not found in dataframe. Check the exact feature name.")
 
-if CORR_FEATURE not in df.columns:
-    raise ValueError(f"Column '{CORR_FEATURE}' not found in dataframe.")
-
-train_dates_idx = pd.DatetimeIndex(dates_train).sort_values()
-
-pump_dates = (
-    df_train.loc[df_train[LABEL_COL] == 1, DATE_COL]
-    .dropna()
-    .unique()
+trades_pivot = (
+    df_structure
+    .pivot_table(index=DATE_COL, columns=GROUP_COL, values="num_trades")
+    .fillna(0)
 )
-pump_dates = pd.DatetimeIndex(pump_dates).sort_values()
+trades_pivot = trades_pivot.reindex(columns=unique_symbols, fill_value=0)
 
-print(f"Pump events in TRAIN: {len(pump_dates)} (unique timestamps)")
+trades_log = np.log1p(trades_pivot)
 
+corr_matrix = trades_log.corr(method="pearson").fillna(0)
+np.fill_diagonal(corr_matrix.values, 0)
 
-def _window_dates_around_pump(pump_date, train_dates_index, window_h=PUMP_WINDOW_HOURS):
-    pos = train_dates_index.searchsorted(pump_date)
-    if pos == len(train_dates_index) or train_dates_index[pos] != pump_date:
-        pos = max(0, pos - 1)
-    left = max(0, pos - window_h)
-    right = pos
-    return train_dates_index[left:right+1]
+# percentile_thresh = np.percentile(corr_matrix.values.flatten(), TARGET_DENSITY * 100)
+# effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
 
+corr_vals = corr_matrix.values
+iu = np.triu_indices_from(corr_vals, k=1)
+offdiag = corr_vals[iu]
 
-def _corr_matrix_on_dates(df_full, dates_window, feature_col, method=CORR_METHOD, symbols_order=None):
-    sub = df_full[df_full[DATE_COL].isin(dates_window)].copy()
-    pivot = sub.pivot_table(index=DATE_COL, columns=GROUP_COL, values=feature_col).fillna(0)
-    if symbols_order is not None:
-        pivot = pivot.reindex(columns=symbols_order, fill_value=0)
-    pivot_log = np.log1p(pivot)
-    corr = pivot_log.corr(method=method).fillna(0)
-    np.fill_diagonal(corr.values, 0)
-    return corr.values
+percentile_thresh = np.percentile(offdiag, TARGET_DENSITY * 100) if offdiag.size else 0.0
+effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
 
+sources, targets, weights = [], [], []
+for i in range(num_nodes):
+    for j in range(i + 1, num_nodes):
+        val = corr_matrix.iloc[i, j]
+        if val > effective_thresh:
+            sources.extend([i, j])
+            targets.extend([j, i])
+            weights.extend([val, val])
 
-# def _effective_threshold(corr_vals, target_density=TARGET_DENSITY, min_thr=MIN_CORR_THRESHOLD):
-#     flat = corr_vals.reshape(-1)
-#     perc_thr = np.percentile(flat, target_density * 100)
-#     return float(max(min_thr, perc_thr))
+if not sources:
+    sources, targets = list(range(num_nodes)), list(range(num_nodes))
+    weights = [1.0] * num_nodes
 
+edge_index = torch.tensor([sources, targets], dtype=torch.long)
+edge_attr  = torch.tensor(weights, dtype=torch.float)
 
-def _effective_threshold(corr_vals, target_density=TARGET_DENSITY, min_thr=MIN_CORR_THRESHOLD):
-    # Paper: Q_rho over off-diagonal correlations {C_ij}_{i<j}
-    iu = np.triu_indices_from(corr_vals, k=1)  # strictly upper triangular (i<j)
-    offdiag = corr_vals[iu]
-
-    # Optional but safe: if offdiag is empty for any reason
-    if offdiag.size == 0:
-        perc_thr = 0.0
-    else:
-        perc_thr = np.percentile(offdiag, target_density * 100)
-
-    return float(max(min_thr, perc_thr))
-
-
-def _edge_stats_to_tensors(edge_stats_dict, num_nodes):
-    if len(edge_stats_dict) == 0:
-        return base_edge_index, base_edge_attr
-
-    sources, targets, weights = [], [], []
-    for (i, j), (s, c) in edge_stats_dict.items():
-        mean_w = float(s) / float(c)
-        sources.extend([i, j])
-        targets.extend([j, i])
-        weights.extend([mean_w, mean_w])
-
-    edge_index = torch.tensor([sources, targets], dtype=torch.long)
-    edge_attr  = torch.tensor(weights, dtype=torch.float)
-    return edge_index, edge_attr
-
-
-if len(pump_dates) == 0:
-    print("WARNING: no pump in TRAIN. Falling back to a static graph built on the full train period.")
-
-    df_structure = df[df[DATE_COL].isin(dates_train)].copy()
-    vol_pivot = df_structure.pivot_table(index=DATE_COL, columns=GROUP_COL, values=CORR_FEATURE).fillna(0)
-    vol_pivot = vol_pivot.reindex(columns=unique_symbols, fill_value=0)
-    vol_log = np.log1p(vol_pivot)
-
-    corr_matrix = vol_log.corr(method=CORR_METHOD).fillna(0)
-    np.fill_diagonal(corr_matrix.values, 0)
-
-    percentile_thresh = np.percentile(corr_matrix.values.flatten(), TARGET_DENSITY * 100)
-    effective_thresh = max(MIN_CORR_THRESHOLD, percentile_thresh)
-
-    sources, targets, weights = [], [], []
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            val = corr_matrix.iloc[i, j]
-            if val > effective_thresh:
-                sources.extend([i, j])
-                targets.extend([j, i])
-                weights.extend([val, val])
-
-    if not sources:
-        final_edge_index, final_edge_attr = base_edge_index, base_edge_attr
-    else:
-        final_edge_index = torch.tensor([sources, targets], dtype=torch.long)
-        final_edge_attr  = torch.tensor(weights, dtype=torch.float)
-
-    dynamic_graph_updates = {}
-else:
-    edge_stats = {}
-    dynamic_graph_updates = {}
-    symbols_order = unique_symbols
-
-    for k, pdate in enumerate(pump_dates):
-        win_dates = _window_dates_around_pump(pdate, train_dates_idx, window_h=PUMP_WINDOW_HOURS)
-
-        corr_vals = _corr_matrix_on_dates(
-            df_full=df,
-            dates_window=win_dates,
-            feature_col=CORR_FEATURE,
-            method=CORR_METHOD,
-            symbols_order=symbols_order
-        )
-
-        thr = _effective_threshold(corr_vals, target_density=TARGET_DENSITY, min_thr=MIN_CORR_THRESHOLD)
-
-        if UPDATE_EXISTING_WITH_LOW_CORR and len(edge_stats) > 0:
-            for (i, j), sc in edge_stats.items():
-                s, c = sc
-                v = float(corr_vals[i, j])
-                edge_stats[(i, j)][0] = s + v
-                edge_stats[(i, j)][1] = c + 1
-
-        mat = corr_vals
-        if USE_ABS_FOR_NEW_EDGES:
-            sel = np.abs(mat) > thr
-        else:
-            sel = mat > thr
-
-        iu = np.triu_indices(num_nodes, k=1)
-        cand_mask = sel[iu]
-        cand_i = iu[0][cand_mask]
-        cand_j = iu[1][cand_mask]
-
-        new_added = 0
-        for i, j in zip(cand_i, cand_j):
-            key = (int(i), int(j))
-            if key not in edge_stats:
-                edge_stats[key] = [float(mat[i, j]), 1]
-                new_added += 1
-            else:
-                if not UPDATE_EXISTING_WITH_LOW_CORR:
-                    edge_stats[key][0] += float(mat[i, j])
-                    edge_stats[key][1] += 1
-
-        curr_edge_index, curr_edge_attr = _edge_stats_to_tensors(edge_stats, num_nodes)
-        dynamic_graph_updates[pdate] = (curr_edge_index, curr_edge_attr)
-
-        print(f"[{k+1}/{len(pump_dates)}] pump @ {pdate} | "
-              f"win={len(win_dates)}h | thr={thr:.4f} | "
-              f"new_edges={new_added} | total_undirected_edges={len(edge_stats)}")
-
-    last_pump = pump_dates[-1]
-    final_edge_index, final_edge_attr = dynamic_graph_updates[last_pump]
-
-print(f"Final graph edges (directed): {final_edge_index.size(1)}")
+print(f"Edges: {edge_index.size(1)} | effective threshold: {effective_thresh:.4f}")
 
 # ----------------------------
-# 7) SCALING + WINDOWING (FIX float64 issue: CLEAN + CLIP as in the previous code)
+# 7) SCALING + WINDOWING (CLEAN + CLIP)
 # ----------------------------
 print("\n--- Scaling & Temporal Window Construction ---")
 
 df_train_subset = df_proc[df_proc[DATE_COL].isin(dates_train)].copy()
 
-# 1) Force numeric conversion
 for c in raw_feature_cols:
     df_train_subset[c] = pd.to_numeric(df_train_subset[c], errors="coerce")
 
-# 2) Replace inf/-inf with NaN
 df_train_subset[raw_feature_cols] = df_train_subset[raw_feature_cols].replace([np.inf, -np.inf], np.nan)
 
-# 3) Clip outliers (train only)
 lower = df_train_subset[raw_feature_cols].quantile(0.0005)
 upper = df_train_subset[raw_feature_cols].quantile(0.9995)
 df_train_subset[raw_feature_cols] = df_train_subset[raw_feature_cols].clip(lower=lower, upper=upper, axis=1)
 
-# 4) Fit scaler on clean float64 data
 scaler = StandardScaler()
 scaler.fit(df_train_subset[raw_feature_cols].fillna(0).astype(np.float64))
 print("Scaler fit OK (after inf replacement + outlier clipping).")
 
 
-def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE, graph_mode="dynamic"):
+def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE):
+    """
+    Each Data object contains:
+      x: [N, W, F]
+      y: [N]
+      mask: [N]
+      edge_index, edge_attr: static
+    """
     snapshots = []
     all_dates_list = df_proc[DATE_COL].unique()
 
@@ -389,7 +261,6 @@ def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE, graph_mode="dy
 
     subset = df_proc[df_proc[DATE_COL].isin(relevant_dates)].copy()
 
-    # Same preprocessing as train: force numeric + replace inf + clip (train thresholds) + scaler
     for c in raw_feature_cols:
         subset[c] = pd.to_numeric(subset[c], errors="coerce")
     subset[raw_feature_cols] = subset[raw_feature_cols].replace([np.inf, -np.inf], np.nan)
@@ -404,17 +275,6 @@ def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE, graph_mode="dy
         indices = [symbol_to_idx[s] for s in group[GROUP_COL]]
         mat[indices] = group[raw_feature_cols].values.astype(np.float32)
         date_to_matrix[date] = mat
-
-    pump_dates_sorted = pd.DatetimeIndex(list(dynamic_graph_updates.keys())).sort_values()
-
-    def graph_for_date(date):
-        if len(pump_dates_sorted) == 0:
-            return final_edge_index, final_edge_attr
-        pos = pump_dates_sorted.searchsorted(date, side="right") - 1
-        if pos < 0:
-            return base_edge_index, base_edge_attr
-        p = pump_dates_sorted[pos]
-        return dynamic_graph_updates[p]
 
     for date in tqdm(target_dates, desc="Generating Windows"):
         curr_idx = np.where(all_dates_list == date)[0][0]
@@ -440,26 +300,21 @@ def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE, graph_mode="dy
         y_t[indices] = current_group[LABEL_COL].values.astype(np.float32)
         mask_t[indices] = True
 
-        if graph_mode == "dynamic":
-            eidx, eattr = graph_for_date(date)
-        else:
-            eidx, eattr = final_edge_index, final_edge_attr
-
         data = Data(
             x=torch.tensor(x_seq, dtype=torch.float),
             y=torch.tensor(y_t, dtype=torch.float),
             mask=torch.tensor(mask_t, dtype=torch.bool),
-            edge_index=eidx,
-            edge_attr=eattr
+            edge_index=edge_index,
+            edge_attr=edge_attr
         )
         snapshots.append(data)
 
     return snapshots
 
 
-train_snapshots = get_temporal_snapshots(dates_train, graph_mode="dynamic")
-val_snapshots   = get_temporal_snapshots(dates_val,   graph_mode="final")
-test_snapshots  = get_temporal_snapshots(dates_test,  graph_mode="final")
+train_snapshots = get_temporal_snapshots(dates_train)
+val_snapshots   = get_temporal_snapshots(dates_val)
+test_snapshots  = get_temporal_snapshots(dates_test)
 
 
 def make_loaders(seed: int):
@@ -477,6 +332,7 @@ def make_loaders(seed: int):
 class TemporalGraphModel(torch.nn.Module):
     def __init__(self, num_features, hidden_channels, heads=HEADS, window_size=WINDOW_SIZE):
         super().__init__()
+
         self.lin_in = Linear(num_features, hidden_channels)
         self.conv1 = TransformerConv(hidden_channels, hidden_channels, heads=heads, edge_dim=1)
         self.conv2 = TransformerConv(hidden_channels * heads, hidden_channels, heads=1, edge_dim=1)
@@ -489,6 +345,7 @@ class TemporalGraphModel(torch.nn.Module):
             batch_first=True
         )
         self.temporal_transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=2)
+
         self.out = Linear(hidden_channels, 1)
         self.pos_embedding = torch.nn.Parameter(torch.randn(1, window_size, hidden_channels))
 
@@ -508,6 +365,7 @@ class TemporalGraphModel(torch.nn.Module):
 
         sequence = torch.stack(temporal_embeddings, dim=1)
         sequence = sequence + self.pos_embedding
+
         time_out = self.temporal_transformer(sequence)
         last_step = time_out[:, -1, :]
         out = self.out(last_step)
@@ -568,10 +426,6 @@ def run_one(seed: int):
 
     @torch.no_grad()
     def tune_threshold_on_validation(val_loader):
-        """
-        Threshold tuning on VALIDATION (precision_recall_curve) -> maximize F1.
-        Returns (best_threshold, best_f1).
-        """
         y_prob, y_true = collect_probs_and_true(val_loader)
         if len(y_true) == 0:
             return FIXED_THRESHOLD, 0.0
@@ -588,7 +442,7 @@ def run_one(seed: int):
         best_f1 = float(np.max(f1s))
         return best_thresh, best_f1
 
-    print(f"\n--- Start Training (Dynamic Graph) ({EPOCHS} epochs) | Seed {seed} ---")
+    print(f"\n--- Start Training (Static Graph) ({EPOCHS} epochs) | Seed {seed} ---")
 
     best_val_f1 = -1.0
     best_model_state = None
@@ -612,10 +466,8 @@ def run_one(seed: int):
 
         avg_train_loss = train_loss / max(1, len(train_loader))
 
-        # Tune threshold on VALIDATION (no leakage)
         tuned_t, tuned_val_f1 = tune_threshold_on_validation(val_loader)
 
-        # Logging: val loss and test f1 with tuned_t (TEST does NOT influence selection)
         val_loss, _ = evaluate_loss_f1(val_loader, thresh=tuned_t)
         _, test_f1 = evaluate_loss_f1(test_loader, thresh=tuned_t)
 
@@ -636,7 +488,7 @@ def run_one(seed: int):
     # ----------------------------
     # FINAL TEST (best checkpoint + best threshold from VALIDATION)
     # ----------------------------
-    print(f"\n\n--- Final Results (Dynamic Graph) | Seed {seed} ---")
+    print(f"\n\n--- Final Results (Static Graph) | Seed {seed} ---")
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
@@ -656,18 +508,16 @@ def run_one(seed: int):
     print("Confusion Matrix:")
     print(confusion_matrix(test_true, final_preds))
 
-    # ----------------------------
-    # ROC-AUC + PR-AUC + SAVE CURVES
-    # ----------------------------
+    # ROC / PR (curves)
     fpr, tpr, roc_thresholds = roc_curve(test_true, test_probs)
-    roc_auc_val = auc(fpr, tpr)  # equivalent to roc_auc_score for binary
+    roc_auc_val = auc(fpr, tpr)
     pr_prec, pr_rec, pr_thresholds = precision_recall_curve(test_true, test_probs)
     pr_auc_val = average_precision_score(test_true, test_probs)
 
-    print(f"ROC-AUC:   {roc_auc_val:.4f}")
+    print(f"ROC-AUC:    {roc_auc_val:.4f}")
     print(f"PR-AUC(AP): {pr_auc_val:.4f}")
 
-    # Save raw arrays to allow recomputing/plotting later
+    # Save raw arrays (for later recompute/plot)
     np.save(os.path.join(OUTPUT_DIR, "test_probs.npy"), test_probs)
     np.save(os.path.join(OUTPUT_DIR, "test_true.npy"), test_true)
 
@@ -679,7 +529,6 @@ def run_one(seed: int):
     np.save(os.path.join(OUTPUT_DIR, "pr_recall.npy"), pr_rec)
     np.save(os.path.join(OUTPUT_DIR, "pr_thresholds.npy"), pr_thresholds)
 
-    # Save a small summary as text (seed-safe because in seed folder)
     with open(os.path.join(OUTPUT_DIR, "summary_metrics.txt"), "w") as f:
         f.write(f"seed={seed}\n")
         f.write(f"final_threshold={final_threshold:.6f}\n")
@@ -689,7 +538,7 @@ def run_one(seed: int):
         f.write(f"roc_auc={roc_auc_val:.6f}\n")
         f.write(f"pr_auc_ap={pr_auc_val:.6f}\n")
 
-    # Save ROC figure (no show)
+    # Save ROC curve (no show)
     plt.figure()
     plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc_val:.3f})")
     plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
@@ -701,7 +550,7 @@ def run_one(seed: int):
     plt.savefig(os.path.join(OUTPUT_DIR, "roc_curve.png"), dpi=200)
     plt.close()
 
-    # Save PR figure (no show)
+    # Save PR curve (no show)
     plt.figure()
     plt.plot(pr_rec, pr_prec, label=f"PR (AP = {pr_auc_val:.3f})")
     baseline = (np.sum(test_true) / max(1, len(test_true))) if len(test_true) else 0.0
@@ -717,7 +566,7 @@ def run_one(seed: int):
     print(f"\nSaved ROC/PR curves + raw arrays into: {OUTPUT_DIR}")
 
     # ----------------------------
-    # PER-TOKEN METRICS (only tokens with >=3 pumps in TEST)
+    # PER-TOKEN METRICS (only tokens with >3 pumps in TEST)
     # ----------------------------
     @torch.no_grad()
     def collect_per_token_predictions(loader, thresh=0.5):
@@ -771,8 +620,7 @@ def run_one(seed: int):
                 "seed": seed,
                 "target_density": TARGET_DENSITY,
                 "dropout": DROPOUT,
-                "pump_window_hours": PUMP_WINDOW_HOURS,
-                "best_val_threshold": final_threshold,
+                "best_val_threshold": float(final_threshold),
                 "token": sym,
                 "n_obs": n_obs,
                 "pumps": pumps,
@@ -785,12 +633,13 @@ def run_one(seed: int):
         "seed": seed,
         "target_density": TARGET_DENSITY,
         "dropout": DROPOUT,
-        "pump_window_hours": PUMP_WINDOW_HOURS,
         "best_val_f1": float(best_val_f1),
         "best_val_threshold": float(final_threshold),
         "test_precision": float(test_precision),
         "test_recall": float(test_recall),
         "test_f1": float(test_f1),
+        "roc_auc": float(roc_auc_val),
+        "pr_auc_ap": float(pr_auc_val),
     }
 
 
@@ -822,13 +671,13 @@ def run_multi_seed():
         pd.DataFrame(PER_TOKEN_ROWS).to_csv(GRID_PER_TOKEN_FILE, index=False)
     else:
         pd.DataFrame(columns=[
-            "seed", "target_density", "dropout", "pump_window_hours", "best_val_threshold",
+            "seed", "target_density", "dropout", "best_val_threshold",
             "token", "n_obs", "pumps", "precision", "recall", "f1"
         ]).to_csv(GRID_PER_TOKEN_FILE, index=False)
 
     summary = (
         df_res
-        .groupby(["target_density", "dropout", "pump_window_hours"], as_index=False)
+        .groupby(["target_density", "dropout"], as_index=False)
         .agg(
             val_f1_mean=("best_val_f1", "mean"),
             val_f1_std=("best_val_f1", "std"),
@@ -836,6 +685,10 @@ def run_multi_seed():
             test_f1_std=("test_f1", "std"),
             test_precision_mean=("test_precision", "mean"),
             test_recall_mean=("test_recall", "mean"),
+            roc_auc_mean=("roc_auc", "mean"),
+            roc_auc_std=("roc_auc", "std"),
+            pr_auc_ap_mean=("pr_auc_ap", "mean"),
+            pr_auc_ap_std=("pr_auc_ap", "std"),
         )
         .sort_values(["val_f1_mean", "test_f1_mean"], ascending=False)
         .reset_index(drop=True)
@@ -846,13 +699,14 @@ def run_multi_seed():
     print("\n==============================")
     print("BEST CONFIG (mean over seeds)")
     print("==============================")
-    print(f"TARGET_DENSITY    = {best['target_density']}")
-    print(f"DROPOUT           = {best['dropout']}")
-    print(f"PUMP_WINDOW_HOURS = {int(best['pump_window_hours'])}")
+    print(f"TARGET_DENSITY = {best['target_density']}")
+    print(f"DROPOUT = {best['dropout']:.2f}")
     print(f"Val F1 (mean±std)  = {best['val_f1_mean']:.4f} ± {best['val_f1_std']:.4f}")
     print(f"Test F1 (mean±std) = {best['test_f1_mean']:.4f} ± {best['test_f1_std']:.4f}")
     print(f"Test Precision mean = {best['test_precision_mean']:.4f}")
     print(f"Test Recall mean    = {best['test_recall_mean']:.4f}")
+    print(f"ROC-AUC (mean±std)  = {best['roc_auc_mean']:.4f} ± {best['roc_auc_std']:.4f}")
+    print(f"PR-AUC (mean±std)   = {best['pr_auc_ap_mean']:.4f} ± {best['pr_auc_ap_std']:.4f}")
 
     print("\nSaved:")
     print(f"- {GRID_RESULTS_FILE}")
@@ -862,5 +716,5 @@ def run_multi_seed():
 
 
 if __name__ == "__main__":
-    print("\n--- Running Multi-Seed Dynamic Graph Experiment ---")
+    print("\n--- Running Multi-Seed Static Graph Experiment ---")
     run_multi_seed()

@@ -98,7 +98,7 @@ TARGET_DENSITY = 0.95
 # DYNAMIC GRAPH CONFIG
 # ----------------------------
 PUMP_WINDOW_HOURS = 12
-CORR_FEATURE = "volume"
+CORR_FEATURE = "num_trades"
 CORR_METHOD = "pearson"
 
 UPDATE_EXISTING_WITH_LOW_CORR = True
@@ -108,7 +108,7 @@ HIDDEN_CHANNELS = 64
 HEADS = 2
 LEARNING_RATE = 0.001
 EPOCHS = 50
-DROPOUT = 0.2
+DROPOUT = 0.3
 BATCH_SIZE = 64
 
 # Not used anymore as the main threshold; kept as fallback
@@ -130,9 +130,9 @@ DROP_COLS_TRAIN = [
 OUTPUT_ROOT = "metrics_outputs_timing"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-GRID_RESULTS_FILE = "grid_results_dynamic_volume_timing.csv"
-GRID_SUMMARY_FILE = "grid_summary_dynamic_volume_timing.csv"
-GRID_PER_TOKEN_FILE = "grid_per_token_results_dynamic_volume_timing.csv"
+GRID_RESULTS_FILE = "grid_results_dynamic_num_trades_timing.csv"
+GRID_SUMMARY_FILE = "grid_summary_dynamic_num_trades_timing.csv"
+GRID_PER_TOKEN_FILE = "grid_per_token_results_dynamic_num_trades_timing.csv"
 
 
 # ----------------------------

@@ -1,56 +1,3 @@
-# =====================================================================================
-# Graph WaveNet reference (adaptive adjacency via learnable node embeddings):
-# - Wu, Zonghan, et al. "Graph WaveNet for Deep Spatial-Temporal Graph Modeling"
-#   (Graph WaveNet introduces an adaptive adjacency matrix learned from node embeddings,
-#   typically via a low-rank factorization and softmax-normalized connectivity scores.)
-#
-# What this script builds (high-level):
-# - A temporal node-classification pipeline over a universe of assets/tokens ("symbols").
-# - For each timestamp, we construct a node feature tensor using a fixed window of
-#   lookback snapshots: x_seq has shape [N_nodes, WINDOW_SIZE, N_features].
-# - We learn a self-adaptive (data-driven) graph structure using two learnable node
-#   embedding tables (E1, E2). Their bilinear product yields a dense score matrix
-#   [N, N] that is row-wise softmax-normalized into a probabilistic adjacency A. -- mean F1 = 78
-#   This is conceptually aligned with Graph WaveNet's adaptive adjacency mechanism:
-#   node embeddings parameterize pairwise affinities, producing a learned connectivity
-#   pattern rather than relying on a fixed, externally provided graph.
-# - We then sparsify A by thresholding (instead of TopK) to obtain edge_index/edge_attr.
-# - Spatial modeling per time step: TransformerConv is applied on the adaptive graph.
-# - Temporal modeling across the window: a TransformerEncoder processes the sequence of
-#   spatial embeddings, and a sigmoid head outputs a probability per node.
-#
-# Notes on the node embedding mechanism and similarity to Graph WaveNet:
-# - E1 and E2 are learnable node representations; scores = E1 @ E2^T defines directed
-#   affinities. Row-wise softmax yields normalized outgoing connection strengths.
-# - Graph WaveNet uses a similar idea: learnable node embeddings form an adaptive
-#   adjacency (often via softmax(ReLU(E1 E2^T))). This script follows that pattern,
-#   then uses a threshold to keep edges above a minimum weight for message passing.
-# =====================================================================================
-
-###  MLP, RF, XGBoost, LSTM -- Luca
-
-### static similarity, static correlation (volume), static correlation (num_trades)
-
-### dynamic with similarity -- Dim, dynamic with correlation (volume), dynamic with correlation (num_trades), dynamic with node embeddings (WaveNet)
-
-### Kind of results:
-    ### F1 score on the entire dataset (mean across 9 seeds) --- table, F1 score per tokens* --- candle stick charts and barplot,
-    ### F1 score + additional features**, F1 score with minutes
-    
-
-### *Select only tokens with 5 or more pump events
-    ### A = [t32 = 1, t100 = 0, ...] --- |A| = 10 --- F1scoreTokenA = ...
-    ### B = [t32 = 1, t101 = 0, ...] --- |B| = 3 --- F1scoreTokenB = ...
-    ### Possible limitation = these performances are computed using the dataset construction around pump events, to better understand the performances on a single
-    ### token history we can consider only one token per time and having the entire history for that token 
-
-### **As Sapienza + prices -- Luca
-
-### Contributions:
-    ### Comprehensive comparison of methods for P&D event with modern static/dynamic spatio-temporal gnns applied to pump-and-dump crime
-    ### pipeline for pump-and-dump crime evaluation/detection
-    ### Code and data given
-
 import numpy as np
 import pandas as pd
 import warnings
@@ -68,15 +15,55 @@ import os
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
-    precision_score, recall_score, f1_score, confusion_matrix
+    precision_score, recall_score, f1_score, confusion_matrix,
+    precision_recall_curve, roc_curve, auc, average_precision_score
 )
 
+# Headless plotting + saving
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 warnings.filterwarnings("ignore")
+
+
+def count_parameters(model: torch.nn.Module, trainable_only: bool = False) -> int:
+    """
+    Return the number of model parameters.
+    - trainable_only=True counts only parameters with requires_grad=True
+    """
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
+
+
+def print_parameter_summary(model: torch.nn.Module, top_k: int = 50) -> None:
+    """
+    Print a summary of total, trainable, and frozen parameters.
+    Also print the first top_k parameter tensors by size.
+    """
+    total = count_parameters(model, trainable_only=False)
+    trainable = count_parameters(model, trainable_only=True)
+    frozen = total - trainable
+
+    print("\n--- Parameter Count ---")
+    print(f"Total params:      {total:,}")
+    print(f"Trainable params:  {trainable:,}")
+    print(f"Frozen params:     {frozen:,}")
+
+    named = [(name, p.numel(), p.requires_grad) for name, p in model.named_parameters()]
+    named.sort(key=lambda x: x[1], reverse=True)
+
+    print(f"\nTop-{min(top_k, len(named))} parameter tensors by size:")
+    for name, n, req in named[:top_k]:
+        flag = "trainable" if req else "frozen"
+        print(f"  {name:50s} {n:12,d}  ({flag})")
+
 
 # ----------------------------
 # 1) SEED
 # ----------------------------
-def set_seed(seed=44):
+def set_seed(seed: int = 44):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -85,15 +72,17 @@ def set_seed(seed=44):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
-    print(f"Seed fissato a {seed}.")
+    print(f"Seed fixed to {seed}.")
 
-set_seed(99)  # Puoi provare anche 66 o 42 per vedere se ora è più stabile
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
+SEEDS = [11, 22, 33, 44, 55, 66, 77, 88, 99]
+
+
 # ----------------------------
-# 2) CONFIG
+# 2) CONFIG BASE
 # ----------------------------
 SPLIT_TRAIN = 0.60
 SPLIT_VAL   = 0.20
@@ -106,62 +95,67 @@ HIDDEN_CHANNELS = 64
 HEADS = 2
 LEARNING_RATE = 0.001
 EPOCHS = 50
-DROPOUT = 0.4
 BATCH_SIZE = 64
 
-# >>> threshold fisso per la classificazione finale
 FIXED_THRESHOLD = 0.5
 
-# ----------------------------
-# SELF-ADAPTIVE ADJACENCY CONFIG
-# ----------------------------
-ADP_DIM = 32
 ADP_USE_RELU = True
 ADP_ADD_SELF_LOOPS = False
-ADP_GRAPH_THRESHOLD = 0.015  # <--- NUOVO: Tiengo archi solo se peso > 1%
 
 DATE_COL   = "date"
 LABEL_COL  = "flag"
 GROUP_COL  = "symbol"
+
 DROP_COLS_TRAIN = [
     DATE_COL, LABEL_COL, GROUP_COL,
-    "high", "low", "close", "group",
-    "log_ret", "ret_BTC", "vola_BTC"
+    "group", "log_ret", "ret_BTC", "vola_BTC", "buy_pressure"
 ]
+
+# ----------------------------
+# OUTPUT DIR
+# ----------------------------
+OUTPUT_ROOT = "metrics_outputs_selfadaptive"
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+GRID_RESULTS_FILE = "grid_results_selfadaptive.csv"
+GRID_SUMMARY_FILE = "grid_summary_selfadaptive.csv"
+GRID_PER_TOKEN_FILE = "grid_per_token_results_selfadaptive.csv"
+
 
 # ----------------------------
 # 3) LOAD DATA
 # ----------------------------
-file_path = r"/home/lidialosav/pump-and-dump-dataset/project/hourly_pump&dump_15112025.csv"
+file_path = r"/home/lidialosav/pump-and-dump-dataset/project/panel_engineered_full.opt.parquet"
 
-print("\n--- Caricamento Dati ---")
+print("\n--- Loading Data ---")
 if not os.path.exists(file_path):
-    raise FileNotFoundError(f"Path non trovato: {file_path}")
+    raise FileNotFoundError(f"Path not found: {file_path}")
 
-df = pd.read_csv(file_path, delimiter=",")
+df = pd.read_parquet(file_path)
 df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
 df = df.sort_values(DATE_COL).reset_index(drop=True)
 df[LABEL_COL] = df[LABEL_COL].astype(int).clip(0, 1)
 
 unique_symbols = df[GROUP_COL].unique()
 symbol_to_idx = {sym: i for i, sym in enumerate(unique_symbols)}
-idx_to_symbol = {i: sym for sym, i in symbol_to_idx.items()}  # <<< ADDED (per metriche per token)
+idx_to_symbol = {i: sym for sym, i in symbol_to_idx.items()}
 num_nodes = len(unique_symbols)
-print(f"Dataset: {len(df)} righe, {num_nodes} token unici.")
+print(f"Dataset: {len(df)} rows, {num_nodes} unique token.")
 
 # ----------------------------
 # 4) FEATURES (RAW)
 # ----------------------------
-print("\n--- Analisi Features ---")
+print("\n--- Feature Analysis ---")
 raw_feature_cols = [
     c for c in df.columns
     if c not in DROP_COLS_TRAIN and np.issubdtype(df[c].dtype, np.number)
 ]
-print(f"Features Selezionate ({len(raw_feature_cols)}): {raw_feature_cols}")
+print(f"Features Selected ({len(raw_feature_cols)}): {raw_feature_cols}")
+
 df_proc = df.copy()
 
 # ----------------------------
-# 5) SPLIT TEMPORALE
+# 5) SPLIT
 # ----------------------------
 unique_dates = df[DATE_COL].unique()
 n_dates = len(unique_dates)
@@ -177,21 +171,32 @@ print(f"Train: {len(dates_train)} h | Val: {len(dates_val)} h | Test: {len(dates
 # ----------------------------
 # 6) SCALING + WINDOWING
 # ----------------------------
-print("\n--- Scaling & Creazione Finestre Temporali ---")
+print("\n--- Scaling & Windowing ---")
 
-df_train_subset = df_proc[df_proc[DATE_COL].isin(dates_train)]
+df_train_subset = df_proc[df_proc[DATE_COL].isin(dates_train)].copy()
+
+for c in raw_feature_cols:
+    df_train_subset[c] = pd.to_numeric(df_train_subset[c], errors="coerce")
+
+df_train_subset[raw_feature_cols] = df_train_subset[raw_feature_cols].replace([np.inf, -np.inf], np.nan)
+
+lower = df_train_subset[raw_feature_cols].quantile(0.0005)
+upper = df_train_subset[raw_feature_cols].quantile(0.9995)
+df_train_subset[raw_feature_cols] = df_train_subset[raw_feature_cols].clip(lower=lower, upper=upper, axis=1)
+
 scaler = StandardScaler()
-scaler.fit(df_train_subset[raw_feature_cols].fillna(0))
+scaler.fit(df_train_subset[raw_feature_cols].fillna(0).astype(np.float64))
+print("Scaler fit OK (after inf replacement + outlier clipping).")
 
-# Dummy edge index per inizializzare l'oggetto Data (il modello lo ignorerà e userà quello adattivo)
+
 dummy_edge_index = torch.tensor([list(range(num_nodes)), list(range(num_nodes))], dtype=torch.long)
 dummy_edge_attr  = torch.ones(num_nodes, dtype=torch.float)
+
 
 def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE):
     snapshots = []
     all_dates_list = df_proc[DATE_COL].unique()
 
-    # buffer per riempire la prima finestra
     min_date_idx = np.searchsorted(all_dates_list, target_dates[0])
     relevant_start_idx = max(0, min_date_idx - window_size + 1)
     relevant_dates = all_dates_list[
@@ -199,7 +204,14 @@ def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE):
     ]
 
     subset = df_proc[df_proc[DATE_COL].isin(relevant_dates)].copy()
-    subset[raw_feature_cols] = scaler.transform(subset[raw_feature_cols].fillna(0))
+
+    for c in raw_feature_cols:
+        subset[c] = pd.to_numeric(subset[c], errors="coerce")
+
+    subset[raw_feature_cols] = subset[raw_feature_cols].replace([np.inf, -np.inf], np.nan)
+    subset[raw_feature_cols] = subset[raw_feature_cols].clip(lower=lower, upper=upper, axis=1)
+    subset[raw_feature_cols] = scaler.transform(subset[raw_feature_cols].fillna(0).astype(np.float64))
+
     grouped = subset.groupby(DATE_COL)
 
     date_to_matrix = {}
@@ -244,26 +256,39 @@ def get_temporal_snapshots(target_dates, window_size=WINDOW_SIZE):
 
     return snapshots
 
+
+print("\n--- Computing Snapshots ---")
 train_snapshots = get_temporal_snapshots(dates_train)
 val_snapshots   = get_temporal_snapshots(dates_val)
 test_snapshots  = get_temporal_snapshots(dates_test)
 
-train_loader = DataLoader(train_snapshots, batch_size=BATCH_SIZE, shuffle=True)
-val_loader   = DataLoader(val_snapshots,   batch_size=BATCH_SIZE, shuffle=False)
-test_loader  = DataLoader(test_snapshots,  batch_size=BATCH_SIZE, shuffle=False)
+
+def make_loaders(seed: int):
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_loader = DataLoader(train_snapshots, batch_size=BATCH_SIZE, shuffle=True, generator=g)
+    val_loader   = DataLoader(val_snapshots,   batch_size=BATCH_SIZE, shuffle=False)
+    test_loader  = DataLoader(test_snapshots,  batch_size=BATCH_SIZE, shuffle=False)
+    return train_loader, val_loader, test_loader
+
 
 # ----------------------------
-# 7) MODELLO (Self-adaptive Graph NO TOPK -> Threshold)
+# 7) MODEL (Self-adaptive Graph NO TOPK -> Threshold)
 # ----------------------------
 class TemporalGraphModelSelfAdaptive(torch.nn.Module):
     def __init__(self, num_features, hidden_channels, num_nodes,
                  heads=HEADS, window_size=WINDOW_SIZE,
-                 adp_dim=ADP_DIM, adp_threshold=ADP_GRAPH_THRESHOLD):
+                 adp_dim=32, adp_threshold=0.015,
+                 dropout=0.4,
+                 adp_use_relu=True, adp_add_self_loops=False):
         super().__init__()
         self.num_nodes = num_nodes
-        self.adp_threshold = adp_threshold
+        self.adp_threshold = float(adp_threshold)
+        self.adp_use_relu = bool(adp_use_relu)
+        self.adp_add_self_loops = bool(adp_add_self_loops)
+        self.dropout = float(dropout)
 
-        # Inizializzazione Xavier per maggiore stabilità
         self.E1 = nn.Parameter(torch.empty(num_nodes, adp_dim))
         self.E2 = nn.Parameter(torch.empty(num_nodes, adp_dim))
         nn.init.xavier_uniform_(self.E1)
@@ -277,7 +302,7 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
             d_model=hidden_channels,
             nhead=8,
             dim_feedforward=128,
-            dropout=DROPOUT,
+            dropout=self.dropout,
             batch_first=True
         )
         self.temporal_transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=2)
@@ -285,35 +310,25 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
         self.pos_embedding = nn.Parameter(torch.randn(1, window_size, hidden_channels))
 
     def build_adaptive_graph_single(self):
-        # 1. Calcolo Scores: E1 @ E2.T  [N, N]
-        scores = self.E1 @ self.E2.t()
-        
-        # 2. ReLU (opzionale, ma aiuta a pulire i negativi)
-        if ADP_USE_RELU:
+        scores = self.E1 @ self.E2.t()  # [N, N]
+
+        if self.adp_use_relu:
             scores = torch.relu(scores)
 
-        # 3. Softmax per riga: Otteniamo pesi probabilistici
         A = torch.softmax(scores, dim=1)
 
-        # 4. >>> RIMOZIONE TOPK <<<
-        # Invece di prendere i K migliori, prendiamo TUTTI quelli che superano la soglia.
-        # Questo permette al gradiente di fluire meglio e non "taglia" connessioni buone 
-        # solo perché sono al posto K+1.
-        if ADP_USE_RELU:
+        if self.adp_use_relu:
             mask = A > self.adp_threshold
         else:
-            mask = (A > self.adp_threshold) | (A < self.adp_threshold) 
-        
-        # Convertiamo la matrice densa mascherata in formato sparso (edge_index)
-        # indices sarà [2, Num_Edges_Sopra_Soglia]
+            mask = (A > self.adp_threshold) | (A < self.adp_threshold)
+
         indices = mask.nonzero(as_tuple=False).t()
         weights = A[mask]
 
         edge_index = indices
         edge_attr  = weights
 
-        # 5. Self loops (opzionale ma consigliato per GNN)
-        if ADP_ADD_SELF_LOOPS:
+        if self.adp_add_self_loops:
             sl = torch.arange(self.num_nodes, device=A.device)
             sl_edge_index = torch.stack([sl, sl], dim=0)
             sl_edge_attr  = torch.ones(self.num_nodes, device=A.device, dtype=torch.float)
@@ -326,8 +341,7 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
     def replicate_graph_for_batch(self, edge_index, edge_attr, batch_size):
         n = self.num_nodes
         E = edge_index.size(1)
-        
-        # Se E=0 (nessun arco sopra soglia), gestiamo il crash creando dummy self-loops per tutto il batch
+
         if E == 0:
             dummy_src = torch.arange(n * batch_size, device=edge_index.device)
             dummy_dst = dummy_src
@@ -348,7 +362,6 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
         batch_nodes, window, feats = x.size()
         B = batch_nodes // self.num_nodes
 
-        # Costruisci grafo dinamico (Threshold-based)
         eidx, eattr = self.build_adaptive_graph_single()
         eidx, eattr = self.replicate_graph_for_batch(eidx, eattr, batch_size=B)
         edge_attr = eattr.view(-1, 1)
@@ -358,7 +371,7 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
             x_t = self.lin_in(x[:, t, :])
             h = self.conv1(x_t, eidx, edge_attr)
             h = F.relu(h)
-            h = F.dropout(h, p=DROPOUT, training=self.training)
+            h = F.dropout(h, p=self.dropout, training=self.training)
             h = self.conv2(h, eidx, edge_attr)
             h = F.relu(h)
             temporal_embeddings.append(h)
@@ -371,155 +384,379 @@ class TemporalGraphModelSelfAdaptive(torch.nn.Module):
         out = self.out(last_step)
         return torch.sigmoid(out).view(-1)
 
-model = TemporalGraphModelSelfAdaptive(
-    num_features=len(raw_feature_cols),
-    hidden_channels=HIDDEN_CHANNELS,
-    num_nodes=num_nodes
-).to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-criterion = torch.nn.BCELoss()
+PER_TOKEN_ROWS = []
 
-@torch.no_grad()
-def evaluate_f1(loader, thresh=0.5):
-    model.eval()
-    all_preds, all_true = [], []
-    total_loss = 0.0
-
-    for batch in loader:
-        batch = batch.to(device)
-        probs = model(batch.x)
-        loss = criterion(probs[batch.mask], batch.y[batch.mask])
-        total_loss += float(loss.item())
-
-        preds = (probs >= thresh).float()
-        all_preds.extend(preds[batch.mask].cpu().numpy())
-        all_true.extend(batch.y[batch.mask].cpu().numpy())
-
-    f1 = f1_score(all_true, all_preds, zero_division=0) if len(all_true) else 0.0
-    avg_loss = total_loss / max(1, len(loader))
-    return avg_loss, f1
-
-@torch.no_grad()
-def collect_probs_and_true(loader):
-    model.eval()
-    probs_list, true_list = [], []
-    for batch in loader:
-        batch = batch.to(device)
-        probs = model(batch.x)
-        probs_list.append(probs[batch.mask].detach().cpu().numpy())
-        true_list.append(batch.y[batch.mask].detach().cpu().numpy())
-    probs = np.concatenate(probs_list, axis=0) if probs_list else np.array([])
-    true  = np.concatenate(true_list, axis=0)  if true_list else np.array([])
-    return probs, true
 
 # ----------------------------
-# 8) TRAINING
+# 8) SINGLE RUN
 # ----------------------------
-print(f"\n--- Start Training (Pure Softmax Graph) ({EPOCHS} epochs) ---")
+def run_one(seed: int, adp_dim: int, adp_threshold: float, dropout: float):
+    set_seed(seed)
 
-best_val_f1 = -1.0
-best_model_state = None
+    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, f"seed_{seed:03d}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-pbar = tqdm(range(EPOCHS), desc="Training", unit="epoch")
-for epoch in pbar:
-    model.train()
-    train_loss = 0.0
+    train_loader, val_loader, test_loader = make_loaders(seed)
 
-    for batch in train_loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+    model = TemporalGraphModelSelfAdaptive(
+        num_features=len(raw_feature_cols),
+        hidden_channels=HIDDEN_CHANNELS,
+        num_nodes=num_nodes,
+        heads=HEADS,
+        window_size=WINDOW_SIZE,
+        adp_dim=adp_dim,
+        adp_threshold=adp_threshold,
+        dropout=dropout,
+        adp_use_relu=ADP_USE_RELU,
+        adp_add_self_loops=ADP_ADD_SELF_LOOPS,
+    ).to(device)
 
-        probs = model(batch.x)
-        loss = criterion(probs[batch.mask], batch.y[batch.mask])
+    print_parameter_summary(model)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = torch.nn.BCELoss()
 
-        loss.backward()
-        optimizer.step()
-        train_loss += float(loss.item())
+    @torch.no_grad()
+    def collect_probs_and_true(loader):
+        model.eval()
+        probs_list, true_list = [], []
+        for batch in loader:
+            batch = batch.to(device)
+            probs = model(batch.x)
+            probs_list.append(probs[batch.mask].detach().cpu().numpy())
+            true_list.append(batch.y[batch.mask].detach().cpu().numpy())
+        probs = np.concatenate(probs_list, axis=0) if probs_list else np.array([])
+        true  = np.concatenate(true_list, axis=0) if true_list else np.array([])
+        return probs, true
 
-    avg_train_loss = train_loss / max(1, len(train_loader))
+    @torch.no_grad()
+    def evaluate_f1(loader, thresh=0.5):
+        model.eval()
+        all_preds, all_true = [], []
+        total_loss = 0.0
 
-    val_loss, val_f1 = evaluate_f1(val_loader, thresh=FIXED_THRESHOLD)
-    _, test_f1 = evaluate_f1(test_loader, thresh=FIXED_THRESHOLD)
+        for batch in loader:
+            batch = batch.to(device)
+            probs = model(batch.x)
+            loss = criterion(probs[batch.mask], batch.y[batch.mask])
+            total_loss += float(loss.item())
 
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
-        best_model_state = copy.deepcopy(model.state_dict())
+            preds = (probs >= thresh).float()
+            all_preds.extend(preds[batch.mask].cpu().numpy())
+            all_true.extend(batch.y[batch.mask].cpu().numpy())
 
-    pbar.set_postfix({
-        "Ltr": f"{avg_train_loss:.3f}",
-        "ValF1@0.5": f"{val_f1:.3f}",
-        "TstF1@0.5": f"{test_f1:.3f}",
-        "BestVal": f"{best_val_f1:.3f}"
-    })
+        f1 = f1_score(all_true, all_preds, zero_division=0) if len(all_true) else 0.0
+        avg_loss = total_loss / max(1, len(loader))
+        return avg_loss, float(f1)
+
+    @torch.no_grad()
+    def tune_threshold_on_validation(val_loader):
+        probs, true = collect_probs_and_true(val_loader)
+        if probs.size == 0:
+            return float(FIXED_THRESHOLD), 0.0
+
+        thresholds = np.linspace(0.0, 1.0, 201, dtype=np.float32)
+        best_t = float(FIXED_THRESHOLD)
+        best_f1 = -1.0
+
+        for t in thresholds:
+            preds = (probs >= t).astype(int)
+            f1 = f1_score(true, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = float(t)
+
+        return best_t, float(best_f1)
+
+    print(f"\n--- Start Training (Self-Adaptive Graph) ({EPOCHS} epochs) | Seed {seed} ---")
+
+    best_val_f1 = -1.0
+    best_model_state = None
+    best_val_threshold = FIXED_THRESHOLD
+
+    pbar = tqdm(range(EPOCHS), desc=f"Training seed {seed}", unit="epoch", leave=False)
+    for epoch in pbar:
+        model.train()
+        train_loss = 0.0
+
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
+            probs = model(batch.x)
+            loss = criterion(probs[batch.mask], batch.y[batch.mask])
+
+            loss.backward()
+            optimizer.step()
+            train_loss += float(loss.item())
+
+        avg_train_loss = train_loss / max(1, len(train_loader))
+
+        tuned_t, tuned_val_f1 = tune_threshold_on_validation(val_loader)
+
+        val_loss, _ = evaluate_f1(val_loader, thresh=tuned_t)
+        _, test_f1 = evaluate_f1(test_loader, thresh=tuned_t)
+
+        if tuned_val_f1 > best_val_f1:
+            best_val_f1 = tuned_val_f1
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_val_threshold = tuned_t
+
+        pbar.set_postfix({
+            "Ltr": f"{avg_train_loss:.3f}",
+            "ValLoss": f"{val_loss:.3f}",
+            "ValF1@t*": f"{tuned_val_f1:.3f}",
+            "t*": f"{tuned_t:.3f}",
+            "TstF1@t*": f"{test_f1:.3f}",
+            "BestVal": f"{best_val_f1:.3f}"
+        })
+
+    # ----------------------------
+    # FINAL TEST (best checkpoint + best threshold from VALIDATION)
+    # ----------------------------
+    print(f"\n\n--- Final Results (Self-Adaptive Graph) | Seed {seed} ---")
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    final_threshold = float(best_val_threshold)
+
+    test_probs, test_true = collect_probs_and_true(test_loader)
+    final_preds = (test_probs >= final_threshold).astype(int)
+
+    test_precision = precision_score(test_true, final_preds, zero_division=0)
+    test_recall = recall_score(test_true, final_preds, zero_division=0)
+    test_f1 = f1_score(test_true, final_preds, zero_division=0)
+
+    print(f"Best threshold from VALIDATION (best checkpoint): {final_threshold:.3f}")
+    print(f"Precision: {test_precision:.4f}")
+    print(f"Recall:    {test_recall:.4f}")
+    print(f"F1 Score:  {test_f1:.4f}")
+    print("Confusion Matrix:")
+    print(confusion_matrix(test_true, final_preds))
+
+    # ----------------------------
+    # ROC-AUC + PR-AUC + SAVE CURVES
+    # ----------------------------
+    fpr, tpr, roc_thresholds = roc_curve(test_true, test_probs)
+    roc_auc_val = auc(fpr, tpr)
+    pr_prec, pr_rec, pr_thresholds = precision_recall_curve(test_true, test_probs)
+    pr_auc_val = average_precision_score(test_true, test_probs)
+
+    print(f"ROC-AUC:   {roc_auc_val:.4f}")
+    print(f"PR-AUC(AP): {pr_auc_val:.4f}")
+
+    # Save raw arrays to allow recomputing/plotting later
+    np.save(os.path.join(OUTPUT_DIR, "test_probs.npy"), test_probs)
+    np.save(os.path.join(OUTPUT_DIR, "test_true.npy"), test_true)
+
+    np.save(os.path.join(OUTPUT_DIR, "roc_fpr.npy"), fpr)
+    np.save(os.path.join(OUTPUT_DIR, "roc_tpr.npy"), tpr)
+    np.save(os.path.join(OUTPUT_DIR, "roc_thresholds.npy"), roc_thresholds)
+
+    np.save(os.path.join(OUTPUT_DIR, "pr_precision.npy"), pr_prec)
+    np.save(os.path.join(OUTPUT_DIR, "pr_recall.npy"), pr_rec)
+    np.save(os.path.join(OUTPUT_DIR, "pr_thresholds.npy"), pr_thresholds)
+
+    # Save a small summary as text (seed-safe because in seed folder)
+    with open(os.path.join(OUTPUT_DIR, "summary_metrics.txt"), "w") as f:
+        f.write(f"seed={seed}\n")
+        f.write(f"final_threshold={final_threshold:.6f}\n")
+        f.write(f"precision={test_precision:.6f}\n")
+        f.write(f"recall={test_recall:.6f}\n")
+        f.write(f"f1={test_f1:.6f}\n")
+        f.write(f"roc_auc={roc_auc_val:.6f}\n")
+        f.write(f"pr_auc_ap={pr_auc_val:.6f}\n")
+
+    # Save ROC figure (no show)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc_val:.3f})")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "roc_curve.png"), dpi=200)
+    plt.close()
+
+    # Save PR figure (no show)
+    plt.figure()
+    plt.plot(pr_rec, pr_prec, label=f"PR (AP = {pr_auc_val:.3f})")
+    baseline = (np.sum(test_true) / max(1, len(test_true))) if len(test_true) else 0.0
+    plt.hlines(baseline, 0, 1, linestyles="--", label=f"Baseline={baseline:.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "pr_curve.png"), dpi=200)
+    plt.close()
+
+    print(f"\nSaved ROC/PR curves + raw arrays into: {OUTPUT_DIR}")
+
+    # ----------------------------
+    # PER-TOKEN METRICS (only tokens with >=3 pumps in TEST)
+    # ----------------------------
+    @torch.no_grad()
+    def collect_per_token_predictions(loader, thresh=0.5):
+        model.eval()
+        token_to_true = {}
+        token_to_pred = {}
+
+        for batch in loader:
+            batch = batch.to(device)
+            probs = model(batch.x)
+            preds = (probs >= thresh).long()
+
+            node_global_idx = torch.arange(batch.x.size(0), device=device)
+            node_local_idx = (node_global_idx % num_nodes).long()
+
+            masked_idx = batch.mask.nonzero(as_tuple=False).view(-1)
+            masked_local = node_local_idx[masked_idx].detach().cpu().numpy()
+            masked_true  = batch.y[masked_idx].detach().cpu().numpy().astype(int)
+            masked_pred  = preds[masked_idx].detach().cpu().numpy().astype(int)
+
+            for li, yt, yp in zip(masked_local, masked_true, masked_pred):
+                sym = idx_to_symbol[int(li)]
+                token_to_true.setdefault(sym, []).append(int(yt))
+                token_to_pred.setdefault(sym, []).append(int(yp))
+
+        return token_to_true, token_to_pred
+
+    token_to_true, token_to_pred = collect_per_token_predictions(test_loader, thresh=final_threshold)
+
+    eligible_tokens = []
+    for sym, ys in token_to_true.items():
+        if int(np.sum(np.array(ys) == 1)) >= 3:
+            eligible_tokens.append(sym)
+
+    print("\n--- Per-Token Metrics (only tokens with >3 pumps in TEST) ---")
+    if not eligible_tokens:
+        print("No token with more than 3 pumps in the test set.")
+    else:
+        for sym in sorted(eligible_tokens):
+            ys = np.array(token_to_true[sym], dtype=int)
+            ps = np.array(token_to_pred[sym], dtype=int)
+
+            p = precision_score(ys, ps, zero_division=0)
+            r = recall_score(ys, ps, zero_division=0)
+            f = f1_score(ys, ps, zero_division=0)
+            pumps = int(np.sum(ys == 1))
+            n_obs = int(len(ys))
+
+            print(f"{sym} | n={n_obs} | pumps={pumps} | Precision={p:.4f} | Recall={r:.4f} | F1={f:.4f}")
+            PER_TOKEN_ROWS.append({
+                "seed": seed,
+                "adp_dim": int(adp_dim),
+                "adp_threshold": float(adp_threshold),
+                "dropout": float(dropout),
+                "best_val_threshold": float(final_threshold),
+                "token": sym,
+                "n_obs": n_obs,
+                "pumps": pumps,
+                "precision": float(p),
+                "recall": float(r),
+                "f1": float(f),
+            })
+
+    return {
+        "seed": seed,
+        "adp_dim": int(adp_dim),
+        "adp_threshold": float(adp_threshold),
+        "dropout": float(dropout),
+        "best_val_f1": float(best_val_f1),
+        "best_val_threshold": float(final_threshold),
+        "test_precision": float(test_precision),
+        "test_recall": float(test_recall),
+        "test_f1": float(test_f1),
+        "roc_auc": float(roc_auc_val),
+        "pr_auc_ap": float(pr_auc_val),
+    }
+
 
 # ----------------------------
-# 9) TEST FINALE
+# 9) GRID SEARCH MULTI-SEED
 # ----------------------------
-print("\n\n--- Risultati Finali (Pure Softmax Graph) ---")
-if best_model_state is not None:
-    model.load_state_dict(best_model_state)
+def grid_search():
+    ADP_DIM_GRID = [48]
+    ADP_THRESHOLD_GRID = [0.005]
+    DROPOUT_GRID = [0.4]
 
-test_probs, test_true = collect_probs_and_true(test_loader)
-final_preds = (test_probs >= FIXED_THRESHOLD).astype(int)
+    results = []
+    total = len(ADP_DIM_GRID) * len(ADP_THRESHOLD_GRID) * len(DROPOUT_GRID) * len(SEEDS)
+    pbar = tqdm(total=total, desc="GridSearch", unit="run")
 
-print(f"Soglia fissa: {FIXED_THRESHOLD:.2f}")
-print(f"Precision: {precision_score(test_true, final_preds, zero_division=0):.4f}")
-print(f"Recall:    {recall_score(test_true, final_preds, zero_division=0):.4f}")
-print(f"F1 Score:  {f1_score(test_true, final_preds, zero_division=0):.4f}")
-print("Confusion Matrix:")
-print(confusion_matrix(test_true, final_preds))
+    for adp_dim in ADP_DIM_GRID:
+        for thr in ADP_THRESHOLD_GRID:
+            for drop in DROPOUT_GRID:
+                for seed in SEEDS:
+                    r = run_one(seed=seed, adp_dim=adp_dim, adp_threshold=thr, dropout=drop)
+                    results.append(r)
 
-# ----------------------------
-# 10) METRICHE PER TOKEN (solo token con pump nel TEST >= 3)  <<< ADDED
-# ----------------------------
-@torch.no_grad()
-def collect_per_token_predictions(loader, thresh=0.5):
-    model.eval()
-    token_to_true = {}
-    token_to_pred = {}
+                    pbar.set_postfix({
+                        "dim": adp_dim,
+                        "thr": thr,
+                        "drop": drop,
+                        "seed": seed,
+                        "valF1": f"{r['best_val_f1']:.3f}",
+                        "tstF1": f"{r['test_f1']:.3f}",
+                    })
+                    pbar.update(1)
 
-    for batch in loader:
-        batch = batch.to(device)
-        probs = model(batch.x)
-        preds = (probs >= thresh).long()
+    pbar.close()
 
-        # Ogni snapshot ha sempre N nodi nello stesso ordine (0..N-1).
-        # Nel batch concatenato, l'indice "locale" del nodo è (global_idx % num_nodes).
-        node_global_idx = torch.arange(batch.x.size(0), device=device)
-        node_local_idx = (node_global_idx % num_nodes).long()
+    df_res = pd.DataFrame(results)
+    df_res.to_csv(GRID_RESULTS_FILE, index=False)
 
-        masked_idx = batch.mask.nonzero(as_tuple=False).view(-1)
-        masked_local = node_local_idx[masked_idx].detach().cpu().numpy()
-        masked_true  = batch.y[masked_idx].detach().cpu().numpy().astype(int)
-        masked_pred  = preds[masked_idx].detach().cpu().numpy().astype(int)
+    if len(PER_TOKEN_ROWS) > 0:
+        pd.DataFrame(PER_TOKEN_ROWS).to_csv(GRID_PER_TOKEN_FILE, index=False)
+    else:
+        pd.DataFrame(columns=[
+            "seed", "adp_dim", "adp_threshold", "dropout", "best_val_threshold",
+            "token", "n_obs", "pumps", "precision", "recall", "f1"
+        ]).to_csv(GRID_PER_TOKEN_FILE, index=False)
 
-        for li, yt, yp in zip(masked_local, masked_true, masked_pred):
-            sym = idx_to_symbol[int(li)]
-            token_to_true.setdefault(sym, []).append(int(yt))
-            token_to_pred.setdefault(sym, []).append(int(yp))
+    summary = (
+        df_res
+        .groupby(["adp_dim", "adp_threshold", "dropout"], as_index=False)
+        .agg(
+            val_f1_mean=("best_val_f1", "mean"),
+            val_f1_std=("best_val_f1", "std"),
+            test_f1_mean=("test_f1", "mean"),
+            test_f1_std=("test_f1", "std"),
+            test_precision_mean=("test_precision", "mean"),
+            test_recall_mean=("test_recall", "mean"),
+            roc_auc_mean=("roc_auc", "mean"),
+            roc_auc_std=("roc_auc", "std"),
+            pr_auc_ap_mean=("pr_auc_ap", "mean"),
+            pr_auc_ap_std=("pr_auc_ap", "std"),
+        )
+        .sort_values(["val_f1_mean", "test_f1_mean"], ascending=False)
+        .reset_index(drop=True)
+    )
+    summary.to_csv(GRID_SUMMARY_FILE, index=False)
 
-    return token_to_true, token_to_pred
+    best = summary.iloc[0].to_dict()
+    print("\n==============================")
+    print("BEST CONFIG (mean over seeds)")
+    print("==============================")
+    print(f"ADP_DIM = {int(best['adp_dim'])}")
+    print(f"ADP_GRAPH_THRESHOLD = {float(best['adp_threshold']):.6f}")
+    print(f"DROPOUT = {float(best['dropout']):.2f}")
+    print(f"Val F1 (mean±std)  = {best['val_f1_mean']:.4f} ± {best['val_f1_std']:.4f}")
+    print(f"Test F1 (mean±std) = {best['test_f1_mean']:.4f} ± {best['test_f1_std']:.4f}")
+    print(f"Test Precision mean = {best['test_precision_mean']:.4f}")
+    print(f"Test Recall mean    = {best['test_recall_mean']:.4f}")
+    print(f"ROC-AUC (mean±std)  = {best['roc_auc_mean']:.4f} ± {best['roc_auc_std']:.4f}")
+    print(f"PR-AUC (mean±std)   = {best['pr_auc_ap_mean']:.4f} ± {best['pr_auc_ap_std']:.4f}")
 
-token_to_true, token_to_pred = collect_per_token_predictions(test_loader, thresh=FIXED_THRESHOLD)
+    print("\nSaved:")
+    print(f"- {GRID_RESULTS_FILE}")
+    print(f"- {GRID_SUMMARY_FILE}")
+    print(f"- {GRID_PER_TOKEN_FILE}")
+    print(f"- {OUTPUT_ROOT}/seed_***/")
 
-eligible_tokens = []
-for sym, ys in token_to_true.items():
-    if int(np.sum(np.array(ys) == 1)) >= 3:
-        eligible_tokens.append(sym)
 
-print("\n--- Metriche per Token (solo token con >=3 pump nel TEST) ---")
-if not eligible_tokens:
-    print("Nessun token con >=3 pump nel test set.")
-else:
-    for sym in sorted(eligible_tokens):
-        ys = np.array(token_to_true[sym], dtype=int)
-        ps = np.array(token_to_pred[sym], dtype=int)
-
-        p = precision_score(ys, ps, zero_division=0)
-        r = recall_score(ys, ps, zero_division=0)
-        f = f1_score(ys, ps, zero_division=0)
-        pumps = int(np.sum(ys == 1))
-        n_obs = int(len(ys))
-
-        print(f"{sym} | n={n_obs} | pumps={pumps} | Precision={p:.4f} | Recall={r:.4f} | F1={f:.4f}")
+if __name__ == "__main__":
+    print("\n--- Running Grid Search Multi-Seed ---")
+    grid_search()
