@@ -1,4 +1,4 @@
-# Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks -- SDS2026 Conference Paper
+# Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks - SDS2026 
 
 This repository contains the code used to build the datasets and reproduce the experiments for the paper:
 "Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks", to appear at the IEEE Swiss Conference on Data Science and AI, 20226.
