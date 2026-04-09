@@ -1,7 +1,7 @@
-# Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks --- SDS2026 Conference Paper
+# Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks -- SDS2026 Conference Paper
 
 This repository contains the code used to build the datasets and reproduce the experiments for the paper:
-"Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks".
+"Fraud Detection in Cryptocurrency Markets with Spatio-Temporal Graph Neural Networks", to appear at the IEEE Swiss Conference on Data Science and AI, 20226.
 
 ## Repository structure
 
@@ -46,6 +46,8 @@ This section documents how we build the **panel datasets** used for pump-and-dum
   * All pump-and-dump events in the dataset are on the trading pair `SYM/BTC`
 * Only rows where `exchange` matches `--exchange-filter` (default: `binance`) are used
 * Binance REST symbol is built as `symbol + quote` (we specifically use quote `BTC`, e.g. `ETHBTC`)
+
+* We have used real-world input data available at: [https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset](https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset).
 
 ### Time handling
 
@@ -340,5 +342,4 @@ A typical full reproduction workflow is:
 
 ## Reference
 
-Pump event source: SystemsLab Sapienza pump-and-dump dataset
-[https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset](https://github.com/SystemsLab-Sapienza/pump-and-dump-dataset)
+Bibtex citation pending
