@@ -1,34 +1,22 @@
 name: pumpdump-stgnn
 channels:
-  - pytorch
-  - nvidia
-  - pyg
   - conda-forge
-
 dependencies:
-  - python=3.10
+  - python=3.9.23
   - pip
-
+  
   # Core scientific stack
   - numpy=1.26.4
-  - pandas=2.2.2
+  - pandas=2.0.3
   - scikit-learn=1.5.1
   - matplotlib=3.9.1
   - tqdm=4.66.5
   - pyarrow=16.1.0
   - xgboost=2.1.1
-
-  # PyTorch + CUDA
-  - pytorch=2.4.1
-  - pytorch-cuda=11.8
-
-  # PyG
-  - pyg=2.6.1
-
+  
   # Optional but useful
   - jupyterlab
   - ipykernel
-
+  
   - pip:
-      - torch-geometric==2.6.1
       - polars
