@@ -121,14 +121,18 @@ mamba env create -f environment.yml
 mamba activate pumpdump-stgnn
 ```
 
-# Install PyTorch (CUDA 11.8)
+### Step 2: Install PyTorch (CUDA 11.8)
 
+```bash
 pip install torch==2.0.1+cu118 --extra-index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
+```
 
-# Install PyTorch Geometric and its dependencies
+### Step 3: Install PyTorch Geometric and its dependencies
 
+```bash
 pip install torch_geometric==2.6.1
 pip install pyg_lib==0.4.0+pt20cu118 torch_scatter==2.1.2+pt20cu118 torch_sparse==0.6.18+pt20cu118 -f [https://data.pyg.org/whl/torch-2.0.1+cu118.html](https://data.pyg.org/whl/torch-2.0.1+cu118.html)
+```
 
 ### Basic environment checks
 
