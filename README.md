@@ -111,21 +111,24 @@ python -m pumpdownloader.cli \
 
 ## Environment setup
 
-We provide an `environment.yml` file for reproducibility.
+To replicate the environment used for this paper, we recommend using [Conda](https://docs.conda.io/en/latest/) or [Mamba](https://mamba.readthedocs.io/en/latest/). The setup is divided into two steps to ensure correct installation of GPU-accelerated libraries on HPC clusters.
 
-### Create the environment
-
-```bash
-conda env create -f environment.yml
-conda activate pumpdump-stgnn
-```
-
-### Update the environment
+### Step 1: Base Environment
+First, create the environment containing the core scientific stack (Python, NumPy, Pandas, etc.) using the provided `environment.yml` file:
 
 ```bash
-conda env update -n pumpdump-stgnn -f environment.yml --prune
-conda activate pumpdump-stgnn
+mamba env create -f environment.yml
+mamba activate pumpdump-stgnn
 ```
+
+# Install PyTorch (CUDA 11.8)
+
+pip install torch==2.0.1+cu118 --extra-index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
+
+# Install PyTorch Geometric and its dependencies
+
+pip install torch_geometric==2.6.1
+pip install pyg_lib==0.4.0+pt20cu118 torch_scatter==2.1.2+pt20cu118 torch_sparse==0.6.18+pt20cu118 -f [https://data.pyg.org/whl/torch-2.0.1+cu118.html](https://data.pyg.org/whl/torch-2.0.1+cu118.html)
 
 ### Basic environment checks
 
